@@ -1,0 +1,1719 @@
+diff --git a/services/search/pkg/search/debouncer.go b/services/search/pkg/search/debouncer.go
+index cce0d0af..3e5de01f 100644
+--- a/services/search/pkg/search/debouncer.go
++++ b/services/search/pkg/search/debouncer.go
+@@ -6,48 +6,413 @@ import (
+ 	"time"
+ 
+ 	provider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
++
++	"github.com/owncloud/ocis/v2/ocis-pkg/log"
+ )
+ 
+-// SpaceDebouncer debounces operations on spaces for a configurable amount of time
++// IndexFunc rebuilds the search index of one space. It must return the error
++// of the space traversal or index commit so that the pending state is kept on
++// failure and only a later successful run can clear it.
++type IndexFunc func(ctx context.Context, id *provider.StorageSpaceId) error
++
++// _maxRetryBackoff caps the delay between failed rebuild attempts.
++const _maxRetryBackoff = 1 * time.Minute
++
++// SpaceDebouncer debounces index runs on spaces for a configurable amount of
++// time.
++//
++// In addition to plain debouncing it guarantees that every accepted change is
++// eventually reflected in the index:
++//
++//   - Every Debounce call is persisted with a per-space generation before the
++//     timer is armed, so a crash inside the debounce window is recovered on the
++//     next startup.
++//   - Changes arriving while a rebuild is running bump the generation again;
++//     the finishing run cannot clear them and another run is scheduled.
++//   - A per-space lock (in-process and, with a persistent store, cross-process)
++//     makes sure consumers or instances never publish overlapping completion
++//     results for the same space.
++//   - Failed traversals/index commits keep the space pending and are retried
++//     with a capped backoff; only success clears the latest generation.
++//   - Close stops timers and waits for started runs; anything still pending
++//     remains persisted for the next startup.
+ type SpaceDebouncer struct {
+-	after      time.Duration
+-	f          func(ctx context.Context, id *provider.StorageSpaceId)
+-	pending    map[string]*time.Timer
+-	inProgress sync.Map
++	after  time.Duration
++	f      IndexFunc
++	store  pendingStore
++	locks  spaceLocker
++	logger log.Logger
++
++	mutex    sync.Mutex
++	timers   map[string]*time.Timer
++	gens     map[string]uint64
++	lastCtx  map[string]context.Context
++	failures map[string]int
++	guards   map[string]chan struct{}
++	wg       sync.WaitGroup
+ 
+-	mutex sync.Mutex
++	started bool
++	closed  bool
+ }
+ 
+-// NewSpaceDebouncer returns a new SpaceDebouncer instance
++// NewSpaceDebouncer returns a new in-memory SpaceDebouncer instance.
++//
++// Pending state is not persisted and runs are only serialized within the
++// process; it is kept for setups without a persistent data path.
+ func NewSpaceDebouncer(d time.Duration, f func(ctx context.Context, id *provider.StorageSpaceId)) *SpaceDebouncer {
++	return newSpaceDebouncer(d, func(ctx context.Context, id *provider.StorageSpaceId) error {
++		f(ctx, id)
++		return nil
++	}, newMemoryPendingStore(), nopSpaceLocker{}, log.NopLogger())
++}
++
++// NewPersistentSpaceDebouncer returns a SpaceDebouncer that survives restarts.
++// Pending spaces are persisted next to the search index in datapath and
++// rebuilds of one space are serialized across all service instances sharing
++// that path.
++func NewPersistentSpaceDebouncer(d time.Duration, f IndexFunc, datapath string, logger log.Logger) (*SpaceDebouncer, error) {
++	store, err := newFilePendingStore(datapath, logger)
++	if err != nil {
++		return nil, err
++	}
++	locks, err := newFileSpaceLocker(datapath)
++	if err != nil {
++		return nil, err
++	}
++	return newSpaceDebouncer(d, f, store, locks, logger), nil
++}
++
++func newSpaceDebouncer(d time.Duration, f IndexFunc, store pendingStore, locks spaceLocker, logger log.Logger) *SpaceDebouncer {
+ 	return &SpaceDebouncer{
+-		after:      d,
+-		f:          f,
+-		pending:    map[string]*time.Timer{},
+-		inProgress: sync.Map{},
++		after:    d,
++		f:        f,
++		store:    store,
++		locks:    locks,
++		logger:   logger,
++		timers:   map[string]*time.Timer{},
++		gens:     map[string]uint64{},
++		lastCtx:  map[string]context.Context{},
++		failures: map[string]int{},
++		guards:   map[string]chan struct{}{},
+ 	}
+ }
+ 
+-// Debounce restars the debounce timer for the given space
++// Debounce restarts the debounce timer for the given space and persists the
++// pending generation so the change survives a crash before the timer fires.
++// Consecutive events on the same space are still merged into one timer.
+ func (d *SpaceDebouncer) Debounce(ctx context.Context, id *provider.StorageSpaceId) {
++	spaceID := id.OpaqueId
++
+ 	d.mutex.Lock()
+ 	defer d.mutex.Unlock()
+ 
+-	if t := d.pending[id.OpaqueId]; t != nil {
+-		t.Stop()
++	gen, err := d.store.Add(spaceID)
++	if err != nil {
++		// Persistence failed: still schedule the run in this process instead
++		// of dropping the change, using a locally increasing generation.
++		d.logger.Error().Err(err).Str("space", spaceID).Msg("could not persist pending space, the change is only tracked until restart")
++		gen = d.gens[spaceID] + 1
++	}
++	d.gens[spaceID] = gen
++	d.failures[spaceID] = 0
++	if ctx != nil {
++		d.lastCtx[spaceID] = ctx
++	}
++	if !d.closed {
++		d.armLocked(spaceID, d.after)
++	}
++}
++
++// RunIndex executes a rebuild on demand (manual IndexSpace) under the same
++// serialization as automatic runs. When the space has a pending generation,
++// its pending state is cleared on success if no newer change arrived during
++// the walk, so a manual rebuild converges to the same final index as the
++// automatic recovery path.
++func (d *SpaceDebouncer) RunIndex(ctx context.Context, id *provider.StorageSpaceId) error {
++	spaceID := id.OpaqueId
++
++	// Wait for an automatic run in this process to finish before acquiring
++	// the cross-process lock; this also prevents same-process double runs.
++	ch := d.guardCh(spaceID)
++	select {
++	case ch <- struct{}{}:
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++	releaseGuard := func() { <-ch }
++
++	release, err := d.locks.lock(ctx, spaceID)
++	if err != nil {
++		releaseGuard()
++		return err
++	}
++	defer func() {
++		release()
++		releaseGuard()
++	}()
++
++	// Capture the generation that this walk is about to cover, now that no
++	// other run for the space can be in progress.
++	d.mutex.Lock()
++	gen := d.gens[spaceID]
++	d.mutex.Unlock()
++
++	if err := d.f(ctx, id); err != nil {
++		return err
++	}
++
++	d.mutex.Lock()
++	defer d.mutex.Unlock()
++	return d.resolveLocked(spaceID, gen, nil)
++}
++
++// Start re-arms the debounce timers for spaces that were still pending when a
++// previous instance stopped. It does not scan all spaces: only spaces found in
++// the persistent store are scheduled, an idle startup does nothing.
++func (d *SpaceDebouncer) Start() {
++	d.mutex.Lock()
++	defer d.mutex.Unlock()
++
++	if d.started || d.closed {
++		return
++	}
++	d.started = true
++
++	pending, err := d.store.List()
++	if err != nil {
++		d.logger.Error().Err(err).Msg("could not load pending spaces, previously accepted changes may be delayed")
++		return
++	}
++	if len(pending) == 0 {
++		return
+ 	}
+ 
+-	d.pending[id.OpaqueId] = time.AfterFunc(d.after, func() {
+-		if _, ok := d.inProgress.Load(id.OpaqueId); ok {
+-			// Reschedule this run for when the previous run has finished
+-			d.mutex.Lock()
+-			d.pending[id.OpaqueId].Reset(d.after)
+-			d.mutex.Unlock()
+-			return
++	d.logger.Info().Int("spaces", len(pending)).Msg("recovering pending space index runs")
++	for _, spaceID := range sortedSpaceIDs(pending) {
++		d.gens[spaceID] = pending[spaceID].Generation
++		if d.lastCtx[spaceID] == nil {
++			d.lastCtx[spaceID] = context.Background()
+ 		}
++		d.armLocked(spaceID, d.after)
++	}
++}
++
++// Close stops accepting new timer runs and waits for runs that already
++// started, bounded by ctx. Pending spaces are never removed here: runs which
++// do not finish in time, or whose process is killed, stay persisted and are
++// taken over by the next startup.
++func (d *SpaceDebouncer) Close(ctx context.Context) error {
++	d.mutex.Lock()
++	d.closed = true
++	for spaceID, t := range d.timers {
++		t.Stop()
++		delete(d.timers, spaceID)
++	}
++	d.mutex.Unlock()
++
++	finished := make(chan struct{})
++	go func() {
++		d.wg.Wait()
++		close(finished)
++	}()
++
++	select {
++	case <-finished:
++	case <-ctx.Done():
++		d.logger.Warn().Msg("shutdown deadline reached while space index runs are still in progress, they remain pending for the next startup")
++	}
++
++	return d.store.Close()
++}
++
++// guardCh returns the in-process serialization channel for a space.
++func (d *SpaceDebouncer) guardCh(spaceID string) chan struct{} {
++	d.mutex.Lock()
++	defer d.mutex.Unlock()
++	return d.guardChLocked(spaceID)
++}
++
++func (d *SpaceDebouncer) guardChLocked(spaceID string) chan struct{} {
++	ch, ok := d.guards[spaceID]
++	if !ok {
++		ch = make(chan struct{}, 1)
++		d.guards[spaceID] = ch
++	}
++	return ch
++}
+ 
+-		d.inProgress.Store(id.OpaqueId, true)
+-		defer d.inProgress.Delete(id.OpaqueId)
+-		d.f(ctx, id)
++// armLocked (re)starts the timer for a space. Callers must hold d.mutex.
++func (d *SpaceDebouncer) armLocked(spaceID string, delay time.Duration) {
++	if t := d.timers[spaceID]; t != nil {
++		t.Stop()
++	}
++	d.timers[spaceID] = time.AfterFunc(delay, func() {
++		d.fire(spaceID)
+ 	})
+ }
++
++// retryDelayLocked computes a capped exponential backoff after failed runs.
++// Callers must hold d.mutex.
++func (d *SpaceDebouncer) retryDelayLocked(spaceID string) time.Duration {
++	fails := d.failures[spaceID]
++	delay := d.after
++	if delay <= 0 {
++		// Avoid a hot retry loop when debouncing was configured without delay.
++		delay = time.Millisecond
++	}
++	for i := 0; i < fails && delay < _maxRetryBackoff; i++ {
++		delay *= 2
++		if delay > _maxRetryBackoff {
++			delay = _maxRetryBackoff
++		}
++	}
++	return delay
++}
++
++// fire is the timer callback: it reserves the in-process guard, acquires the
++// cross-process space lock and runs the rebuild for the latest generation.
++func (d *SpaceDebouncer) fire(spaceID string) {
++	d.mutex.Lock()
++	if d.closed {
++		d.mutex.Unlock()
++		return
++	}
++	delete(d.timers, spaceID)
++
++	gen := d.gens[spaceID]
++	if gen == 0 {
++		// Nothing pending anymore, e.g. a manual rebuild already covered it.
++		d.mutex.Unlock()
++		return
++	}
++
++	ch := d.guardChLocked(spaceID)
++	select {
++	case ch <- struct{}{}:
++	default:
++		// A run on this space is already active in this process. The run's
++		// post-check reschedules itself when the generation advanced.
++		d.armLocked(spaceID, d.after)
++		d.mutex.Unlock()
++		return
++	}
++	// Register while holding d.mutex so Close can never race Add with Wait.
++	d.wg.Add(1)
++	ctx := d.lastCtx[spaceID]
++	d.mutex.Unlock()
++
++	if ctx == nil {
++		ctx = context.Background()
++	}
++
++	release, ok, err := d.locks.tryLock(spaceID)
++	if err != nil {
++		d.logger.Error().Err(err).Str("space", spaceID).Msg("could not acquire space index lock")
++		<-ch
++		d.wg.Done()
++		d.mutex.Lock()
++		if !d.closed {
++			d.armLocked(spaceID, d.retryDelayLocked(spaceID))
++		}
++		d.mutex.Unlock()
++		return
++	}
++	if !ok {
++		// Another instance is rebuilding this space. It keeps the pending
++		// state and will clear it on success; just check back afterwards.
++		<-ch
++		d.wg.Done()
++		d.mutex.Lock()
++		if !d.closed && d.gens[spaceID] != 0 {
++			d.armLocked(spaceID, d.after)
++		}
++		d.mutex.Unlock()
++		return
++	}
++
++	// Done only after finalizing the pending state, so Close never returns
++	// before a successful completion has been persisted.
++	defer d.wg.Done()
++
++	runErr := d.f(ctx, &provider.StorageSpaceId{OpaqueId: spaceID})
++	release()
++	<-ch
++
++	d.mutex.Lock()
++	defer d.mutex.Unlock()
++	d.resolveLocked(spaceID, gen, runErr)
++}
++
++// resolveLocked finalizes a run: failures keep the space pending and are
++// retried; success clears the captured generation only if no newer change
++// arrived, otherwise another run is scheduled. Callers must hold d.mutex.
++func (d *SpaceDebouncer) resolveLocked(spaceID string, gen uint64, runErr error) error {
++	if runErr != nil {
++		d.failures[spaceID]++
++		if d.closed {
++			return runErr
++		}
++		d.logger.Error().
++			Err(runErr).
++			Str("space", spaceID).
++			Int("attempt", d.failures[spaceID]).
++			Msg("space indexing failed, the space stays pending and will be retried")
++		d.armLocked(spaceID, d.retryDelayLocked(spaceID))
++		return runErr
++	}
++
++	d.failures[spaceID] = 0
++
++	// CAS in the store: the entry is only cleared when no newer generation
++	// superseded the run that just finished.
++	cleared, err := d.store.Done(spaceID, gen)
++	if err != nil {
++		d.logger.Error().Err(err).Str("space", spaceID).Msg("could not mark space as indexed, it stays pending")
++		if !d.closed {
++			d.armLocked(spaceID, d.after)
++		}
++		return err
++	}
++
++	if cleared {
++		delete(d.gens, spaceID)
++		delete(d.lastCtx, spaceID)
++		if t := d.timers[spaceID]; t != nil {
++			// A timer may only exist if a change arrived during the run, in
++			// which case Done would not have cleared the entry. Stop it
++			// defensively to avoid a redundant scan.
++			t.Stop()
++			delete(d.timers, spaceID)
++		}
++		return nil
++	}
++
++	if d.gens[spaceID] == gen {
++		// No newer change was seen locally, yet the generation is gone from
++		// the shared store: another consumer or instance finished the same
++		// generation. Resync the local mirror instead of re-running forever.
++		delete(d.gens, spaceID)
++		delete(d.lastCtx, spaceID)
++		if t := d.timers[spaceID]; t != nil {
++			t.Stop()
++			delete(d.timers, spaceID)
++		}
++		return nil
++	}
++
++	if d.gens[spaceID] == 0 {
++		// Already resynced while the run was finishing.
++		if t := d.timers[spaceID]; t != nil {
++			t.Stop()
++			delete(d.timers, spaceID)
++		}
++		return nil
++	}
++
++	// A newer generation exists because a change was accepted while this run
++	// was active; schedule the run that covers it.
++	if !d.closed && d.timers[spaceID] == nil {
++		d.armLocked(spaceID, d.after)
++	}
++	return nil
++}
+diff --git a/services/search/pkg/search/debouncer_persistent_test.go b/services/search/pkg/search/debouncer_persistent_test.go
+new file mode 100644
+index 00000000..29542a35
+--- /dev/null
++++ b/services/search/pkg/search/debouncer_persistent_test.go
+@@ -0,0 +1,298 @@
++package search_test
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"os"
++	"path/filepath"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	sprovider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++
++	"github.com/owncloud/ocis/v2/ocis-pkg/log"
++	"github.com/owncloud/ocis/v2/services/search/pkg/search"
++)
++
++const _pendingStoreFileName = "pending_spaces.json"
++
++func readPendingSpaces(dir string) (map[string]json.RawMessage, error) {
++	raw, err := os.ReadFile(filepath.Join(dir, _pendingStoreFileName))
++	if err != nil {
++		return nil, err
++	}
++	var data struct {
++		Spaces map[string]json.RawMessage `json:"spaces"`
++	}
++	if err := json.Unmarshal(raw, &data); err != nil {
++		return nil, err
++	}
++	return data.Spaces, nil
++}
++
++var _ = Describe("Persistent SpaceDebouncer", func() {
++	var (
++		dir string
++		ctx = context.Background()
++		sid = &sprovider.StorageSpaceId{OpaqueId: "storageid$spaceid!spaceid"}
++	)
++
++	BeforeEach(func() {
++		var err error
++		dir, err = os.MkdirTemp("", "search-pending-")
++		Expect(err).ToNot(HaveOccurred())
++	})
++
++	AfterEach(func() {
++		_ = os.RemoveAll(dir)
++	})
++
++	It("persists an accepted change before the timer fires and recovers it after a restart", func() {
++		var runs atomic.Int32
++
++		// The first instance accepts the change but is stopped before the
++		// debounce window elapses.
++		d1, err := search.NewPersistentSpaceDebouncer(time.Hour, func(_ context.Context, _ *sprovider.StorageSpaceId) error {
++			runs.Add(1)
++			return nil
++		}, dir, log.NopLogger())
++		Expect(err).ToNot(HaveOccurred())
++
++		d1.Debounce(ctx, sid)
++		Eventually(func() []string {
++			spaces, err := readPendingSpaces(dir)
++			Expect(err).ToNot(HaveOccurred())
++			ids := make([]string, 0, len(spaces))
++			for id := range spaces {
++				ids = append(ids, id)
++			}
++			return ids
++		}, "1s", "10ms").Should(ContainElement(sid.OpaqueId))
++
++		Expect(d1.Close(ctx)).To(Succeed())
++		Expect(int(runs.Load())).To(Equal(0))
++
++		// A fresh instance finds the pending space on startup and converges,
++		// without any new event arriving.
++		d2, err := search.NewPersistentSpaceDebouncer(40*time.Millisecond, func(_ context.Context, _ *sprovider.StorageSpaceId) error {
++			runs.Add(1)
++			return nil
++		}, dir, log.NopLogger())
++		Expect(err).ToNot(HaveOccurred())
++		d2.Start()
++		defer func() { _ = d2.Close(ctx) }()
++
++		Eventually(func() int { return int(runs.Load()) }, "2s", "10ms").Should(Equal(1))
++		Eventually(func() int {
++			spaces, err := readPendingSpaces(dir)
++			Expect(err).ToNot(HaveOccurred())
++			return len(spaces)
++		}, "1s", "10ms").Should(Equal(0))
++
++		Consistently(func() int { return int(runs.Load()) }, "300ms", "20ms").Should(Equal(1))
++	})
++
++	It("does not clear changes that arrive while an earlier rebuild is running", func() {
++		var runs atomic.Int32
++		entered := make(chan struct{}, 2)
++		proceed := make(chan struct{})
++
++		d, err := search.NewPersistentSpaceDebouncer(40*time.Millisecond, func(_ context.Context, _ *sprovider.StorageSpaceId) error {
++			runs.Add(1)
++			entered <- struct{}{}
++			<-proceed
++			return nil
++		}, dir, log.NopLogger())
++		Expect(err).ToNot(HaveOccurred())
++		defer func() { _ = d.Close(ctx) }()
++
++		d.Debounce(ctx, sid)
++		Eventually(entered, "2s").Should(Receive()) // first rebuild starts
++
++		// Another change is accepted while the first rebuild is still running.
++		d.Debounce(ctx, sid)
++		close(proceed)
++
++		Eventually(func() int { return int(runs.Load()) }, "2s", "10ms").Should(Equal(2))
++		Eventually(func() int {
++			spaces, err := readPendingSpaces(dir)
++			Expect(err).ToNot(HaveOccurred())
++			return len(spaces)
++		}, "1s", "10ms").Should(Equal(0))
++		Consistently(func() int { return int(runs.Load()) }, "300ms", "20ms").Should(Equal(2))
++	})
++
++	It("keeps the space pending when traversal fails and a later instance succeeds", func() {
++		var failedAttempts atomic.Int32
++		d1, err := search.NewPersistentSpaceDebouncer(40*time.Millisecond, func(_ context.Context, _ *sprovider.StorageSpaceId) error {
++			failedAttempts.Add(1)
++			return errors.New("space traversal failed")
++		}, dir, log.NopLogger())
++		Expect(err).ToNot(HaveOccurred())
++
++		d1.Debounce(ctx, sid)
++		Eventually(func() int { return int(failedAttempts.Load()) }, "2s", "10ms").Should(BeNumerically(">=", 1))
++		Expect(d1.Close(ctx)).To(Succeed())
++
++		// The failed generation is still present after the instance stopped.
++		spaces, err := readPendingSpaces(dir)
++		Expect(err).ToNot(HaveOccurred())
++		Expect(spaces).To(HaveKey(sid.OpaqueId))
++
++		var recoveredRuns atomic.Int32
++		d2, err := search.NewPersistentSpaceDebouncer(40*time.Millisecond, func(_ context.Context, _ *sprovider.StorageSpaceId) error {
++			recoveredRuns.Add(1)
++			return nil
++		}, dir, log.NopLogger())
++		Expect(err).ToNot(HaveOccurred())
++		d2.Start()
++		defer func() { _ = d2.Close(ctx) }()
++
++		Eventually(func() int { return int(recoveredRuns.Load()) }, "2s", "10ms").Should(Equal(1))
++		Eventually(func() int {
++			spaces, err := readPendingSpaces(dir)
++			Expect(err).ToNot(HaveOccurred())
++			return len(spaces)
++		}, "1s", "10ms").Should(Equal(0))
++	})
++
++	It("clears a pending generation when a manual RunIndex covers it", func() {
++		var runs atomic.Int32
++		d, err := search.NewPersistentSpaceDebouncer(time.Hour, func(_ context.Context, _ *sprovider.StorageSpaceId) error {
++			runs.Add(1)
++			return nil
++		}, dir, log.NopLogger())
++		Expect(err).ToNot(HaveOccurred())
++		defer func() { _ = d.Close(ctx) }()
++
++		d.Debounce(ctx, sid) // pending, automatic timer far in the future
++
++		Expect(d.RunIndex(ctx, sid)).To(Succeed())
++		Expect(int(runs.Load())).To(Equal(1))
++		spaces, err := readPendingSpaces(dir)
++		Expect(err).ToNot(HaveOccurred())
++		Expect(spaces).To(BeEmpty())
++
++		// A manual run without pending changes still walks and leaves no state.
++		Expect(d.RunIndex(ctx, sid)).To(Succeed())
++		Expect(int(runs.Load())).To(Equal(2))
++		spaces, err = readPendingSpaces(dir)
++		Expect(err).ToNot(HaveOccurred())
++		Expect(spaces).To(BeEmpty())
++
++		Consistently(func() int { return int(runs.Load()) }, "200ms", "20ms").Should(Equal(2))
++	})
++
++	It("schedules the automatic follow-up when a change arrives during the manual walk", func() {
++		var (
++			runs     atomic.Int32
++			entered  = make(chan struct{}, 2)
++			proceed  = make(chan struct{})
++			manualMu sync.Mutex
++			manualErr error
++		)
++
++		d, err := search.NewPersistentSpaceDebouncer(40*time.Millisecond, func(_ context.Context, _ *sprovider.StorageSpaceId) error {
++			runs.Add(1)
++			entered <- struct{}{}
++			<-proceed
++			return nil
++		}, dir, log.NopLogger())
++		Expect(err).ToNot(HaveOccurred())
++		defer func() { _ = d.Close(ctx) }()
++
++		d.Debounce(ctx, sid) // gen 1
++
++		go func() {
++			err := d.RunIndex(ctx, sid)
++			manualMu.Lock()
++			manualErr = err
++			manualMu.Unlock()
++		}()
++		Eventually(entered, "2s").Should(Receive())
++
++		d.Debounce(ctx, sid) // gen 2, accepted during the manual walk
++		close(proceed)
++
++		Eventually(func() error {
++			manualMu.Lock()
++			defer manualMu.Unlock()
++			return manualErr
++		}, "2s", "10ms").Should(BeNil())
++		Eventually(func() int { return int(runs.Load()) }, "2s", "10ms").Should(Equal(2))
++		Eventually(func() int {
++			spaces, err := readPendingSpaces(dir)
++			Expect(err).ToNot(HaveOccurred())
++			return len(spaces)
++		}, "1s", "10ms").Should(Equal(0))
++	})
++
++	It("never runs two instances of the same space concurrently and converges without overwriting completions", func() {
++		var (
++			runs        atomic.Int32
++			overlaps    atomic.Int32
++			running     atomic.Int32
++		)
++		indexFunc := func(_ context.Context, _ *sprovider.StorageSpaceId) error {
++			runs.Add(1)
++			if !running.CompareAndSwap(0, 1) {
++				overlaps.Add(1)
++			}
++			time.Sleep(200 * time.Millisecond)
++			running.Store(0)
++			return nil
++		}
++
++		d1, err := search.NewPersistentSpaceDebouncer(30*time.Millisecond, indexFunc, dir, log.NopLogger())
++		Expect(err).ToNot(HaveOccurred())
++		d2, err := search.NewPersistentSpaceDebouncer(30*time.Millisecond, indexFunc, dir, log.NopLogger())
++		Expect(err).ToNot(HaveOccurred())
++		d1.Start()
++		d2.Start()
++		defer func() { _ = d1.Close(ctx) }()
++		defer func() { _ = d2.Close(ctx) }()
++
++		// Both instances accept the change for the same space.
++		d1.Debounce(ctx, sid)
++		d2.Debounce(ctx, sid)
++
++		Eventually(func() int { return int(runs.Load()) }, "2s", "20ms").Should(BeNumerically(">=", 1))
++		Eventually(func() int {
++			spaces, err := readPendingSpaces(dir)
++			Expect(err).ToNot(HaveOccurred())
++			return len(spaces)
++		}, "3s", "20ms").Should(Equal(0))
++
++		// After convergence no further runs are scheduled, and runs never
++		// overlapped.
++		Eventually(func() int { return int(runs.Load()) }, "1s").Should(BeNumerically("<=", 2))
++		Consistently(func() int { return int(runs.Load()) }, "400ms", "30ms").Should(Equal(2))
++		Expect(int(overlaps.Load())).To(Equal(0))
++	})
++
++	It("lets a graceful Close finish a started successful rebuild", func() {
++		var runs atomic.Int32
++		d, err := search.NewPersistentSpaceDebouncer(40*time.Millisecond, func(_ context.Context, _ *sprovider.StorageSpaceId) error {
++			runs.Add(1)
++			time.Sleep(150 * time.Millisecond)
++			return nil
++		}, dir, log.NopLogger())
++		Expect(err).ToNot(HaveOccurred())
++
++		d.Debounce(ctx, sid)
++		time.Sleep(100 * time.Millisecond) // let the rebuild start
++
++		shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
++		defer cancel()
++		Expect(d.Close(shutdownCtx)).To(Succeed())
++
++		Expect(int(runs.Load())).To(Equal(1))
++		spaces, err := readPendingSpaces(dir)
++		Expect(err).ToNot(HaveOccurred())
++		Expect(spaces).To(BeEmpty())
++	})
++})
+diff --git a/services/search/pkg/search/events.go b/services/search/pkg/search/events.go
+index 6142dcb0..89c30d2a 100644
+--- a/services/search/pkg/search/events.go
++++ b/services/search/pkg/search/events.go
+@@ -13,6 +13,13 @@ import (
+ 	"github.com/owncloud/reva/v2/pkg/storagespace"
+ )
+ 
++// spaceIndexerProvider is implemented by searchers that own a persistent
++// SpaceDebouncer. It lets the event consumer reuse the same debouncer (and
++// therefore pending generations and locks) as manual IndexSpace calls.
++type spaceIndexerProvider interface {
++	spaceIndexer() *SpaceDebouncer
++}
++
+ // HandleEvents listens to the needed events,
+ // it handles the whole resource indexing livecycle.
+ func HandleEvents(s Searcher, bus events.Consumer, logger log.Logger, cfg *config.Config) error {
+@@ -54,11 +61,26 @@ func HandleEvents(s Searcher, bus events.Consumer, logger log.Logger, cfg *confi
+ 		}
+ 	}
+ 
+-	indexSpaceDebouncer := NewSpaceDebouncer(time.Duration(cfg.Events.DebounceDuration)*time.Millisecond, func(ctx context.Context, id *provider.StorageSpaceId) {
+-		if err := s.IndexSpace(ctx, id); err != nil {
+-			logger.Error().Err(err).Interface("spaceID", id).Msg("error while indexing a space")
+-		}
+-	})
++	// Reuse the search service's persistent debouncer when available so that
++	// event-triggered and manual rebuilds share pending generations, per-space
++	// serialization and crash recovery. Searchers without a persistent data
++	// path (e.g. in tests) fall back to the in-memory debouncer.
++	var indexSpaceDebouncer *SpaceDebouncer
++	if idxProvider, ok := s.(spaceIndexerProvider); ok {
++		indexSpaceDebouncer = idxProvider.spaceIndexer()
++	}
++	if indexSpaceDebouncer == nil {
++		indexSpaceDebouncer = NewSpaceDebouncer(time.Duration(cfg.Events.DebounceDuration)*time.Millisecond, func(ctx context.Context, id *provider.StorageSpaceId) {
++			if err := s.IndexSpace(ctx, id); err != nil {
++				logger.Error().Err(err).Interface("spaceID", id).Msg("error while indexing a space")
++			}
++		})
++	} else {
++		// Recover spaces that were still pending when a previous instance
++		// stopped. Only persisted pending spaces are scheduled, an idle
++		// startup never scans all spaces.
++		indexSpaceDebouncer.Start()
++	}
+ 
+ 	// trace provider is available here, otherwise the search service should have crashed
+ 	tp, _ := tracing.GetServiceTraceProvider(cfg.Tracing, cfg.Service.Name)
+diff --git a/services/search/pkg/search/pending_store.go b/services/search/pkg/search/pending_store.go
+new file mode 100644
+index 00000000..b2e7fa34
+--- /dev/null
++++ b/services/search/pkg/search/pending_store.go
+@@ -0,0 +1,411 @@
++package search
++
++import (
++	"context"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io/fs"
++	"os"
++	"path/filepath"
++	"runtime"
++	"sort"
++	"sync"
++	"time"
++
++	"github.com/gofrs/flock"
++
++	"github.com/owncloud/ocis/v2/ocis-pkg/log"
++)
++
++const (
++	// _pendingStoreVersion is the schema version of the persisted pending file.
++	_pendingStoreVersion = 1
++	// _pendingStoreFile is the JSON file holding spaces that still need a
++	// successful (re)index run. It lives next to the bleve index directory.
++	_pendingStoreFile = "pending_spaces.json"
++	// _pendingStoreLock serializes read-modify-write access to the store
++	// across all search service instances sharing the data path.
++	_pendingStoreLock = "pending_spaces.lock"
++	// _pendingLocksDir contains one cross-process lock file per space, used to
++	// make sure only a single instance rebuilds a space at any given time.
++	_pendingLocksDir = "space-locks"
++)
++
++// pendingSpace is the persisted state of one space whose index is not yet in
++// sync with storage.
++type pendingSpace struct {
++	// Generation is bumped for every change that is scheduled for the space.
++	// A rebuild may only clear the pending state when it finishes the latest
++	// known generation, otherwise changes arriving during the run would be
++	// lost.
++	Generation uint64 `json:"generation"`
++	// EnqueuedAt records when the latest change for the space was accepted.
++	EnqueuedAt time.Time `json:"enqueued_at"`
++}
++
++type pendingStoreData struct {
++	Version int                    `json:"version"`
++	Spaces  map[string]pendingSpace `json:"spaces"`
++}
++
++// pendingStore persists spaces waiting for a successful index run. Every
++// accepted change is persisted immediately, so a crash before the debounce
++// timer fires or during a rebuild leaves a state the next startup can resume.
++type pendingStore interface {
++	// List returns all currently pending spaces.
++	List() (map[string]pendingSpace, error)
++	// Add marks a space as pending, bumping its generation, and returns the
++	// new generation.
++	Add(spaceID string) (uint64, error)
++	// Done clears the pending state of a space when its stored generation
++	// exactly matches generation. It returns false without changing anything
++	// when a newer generation superseded the one that just finished or when
++	// another consumer already cleared it. A generation of 0 is a no-op.
++	Done(spaceID string, generation uint64) (bool, error)
++	Close() error
++}
++
++// memoryPendingStore is an in-process pendingStore used when no persistent
++// data path is configured (tests and in-memory indexes).
++type memoryPendingStore struct {
++	mu     sync.Mutex
++	spaces map[string]pendingSpace
++}
++
++func newMemoryPendingStore() *memoryPendingStore {
++	return &memoryPendingStore{spaces: map[string]pendingSpace{}}
++}
++
++func (s *memoryPendingStore) List() (map[string]pendingSpace, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	out := make(map[string]pendingSpace, len(s.spaces))
++	for id, sp := range s.spaces {
++		out[id] = sp
++	}
++	return out, nil
++}
++
++func (s *memoryPendingStore) Add(spaceID string) (uint64, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	sp := s.spaces[spaceID]
++	sp.Generation++
++	sp.EnqueuedAt = time.Now()
++	s.spaces[spaceID] = sp
++	return sp.Generation, nil
++}
++
++func (s *memoryPendingStore) Done(spaceID string, generation uint64) (bool, error) {
++	if generation == 0 {
++		return false, nil
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	if s.spaces[spaceID].Generation != generation {
++		return false, nil
++	}
++	delete(s.spaces, spaceID)
++	return true, nil
++}
++
++func (s *memoryPendingStore) Close() error { return nil }
++
++// filePendingStore persists pending spaces as JSON next to the search index.
++// All access is cross-process safe: mutations hold an flock during the whole
++// read-modify-write cycle, and the JSON file is replaced atomically.
++type filePendingStore struct {
++	path   string
++	logger log.Logger
++
++	mu   sync.Mutex
++	flk  *flock.Flock
++}
++
++// newFilePendingStore creates (or opens) the persistent pending store inside
++// the given search data directory.
++func newFilePendingStore(datapath string, logger log.Logger) (*filePendingStore, error) {
++	if datapath == "" {
++		return nil, errors.New("a data path is required for the persistent pending store")
++	}
++	if err := os.MkdirAll(datapath, 0o700); err != nil {
++		return nil, fmt.Errorf("create search data directory %s: %w", datapath, err)
++	}
++	s := &filePendingStore{
++		path:   filepath.Join(datapath, _pendingStoreFile),
++		logger: logger,
++		flk:    flock.New(filepath.Join(datapath, _pendingStoreLock)),
++	}
++	return s, nil
++}
++
++// withFileLock runs fn while holding the cross-process store lock.
++func (s *filePendingStore) withFileLock(fn func() error) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	if err := s.flk.Lock(); err != nil {
++		return fmt.Errorf("acquire pending store lock: %w", err)
++	}
++	defer func() { _ = s.flk.Unlock() }()
++
++	return fn()
++}
++
++func (s *filePendingStore) List() (map[string]pendingSpace, error) {
++	out := map[string]pendingSpace{}
++	err := s.withFileLock(func() error {
++		data, err := s.loadLocked()
++		if err != nil {
++			return err
++		}
++		for id, sp := range data.Spaces {
++			out[id] = sp
++		}
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (s *filePendingStore) Add(spaceID string) (uint64, error) {
++	var generation uint64
++	err := s.withFileLock(func() error {
++		data, err := s.loadLocked()
++		if err != nil {
++			return err
++		}
++		sp := data.Spaces[spaceID]
++		sp.Generation++
++		sp.EnqueuedAt = time.Now()
++		data.Spaces[spaceID] = sp
++		generation = sp.Generation
++		return s.saveLocked(data)
++	})
++	if err != nil {
++		return 0, err
++	}
++	return generation, nil
++}
++
++func (s *filePendingStore) Done(spaceID string, generation uint64) (bool, error) {
++	if generation == 0 {
++		return false, nil
++	}
++	cleared := false
++	err := s.withFileLock(func() error {
++		data, err := s.loadLocked()
++		if err != nil {
++			return err
++		}
++		// Only clear when exactly the generation that just finished is still
++		// the latest one. A newer generation (a change accepted during the
++		// run) or an already-cleared entry must never be overwritten.
++		if data.Spaces[spaceID].Generation != generation {
++			return nil
++		}
++		delete(data.Spaces, spaceID)
++		cleared = true
++		return s.saveLocked(data)
++	})
++	if err != nil {
++		return false, err
++	}
++	return cleared, nil
++}
++
++func (s *filePendingStore) Close() error { return nil }
++
++// loadLocked reads and decodes the store. The caller must hold the file lock.
++// A missing file means nothing is pending. A corrupt file is quarantined
++// instead of wedging the service forever.
++func (s *filePendingStore) loadLocked() (*pendingStoreData, error) {
++	data := &pendingStoreData{
++		Version: _pendingStoreVersion,
++		Spaces:  map[string]pendingSpace{},
++	}
++
++	raw, err := os.ReadFile(s.path)
++	if errors.Is(err, fs.ErrNotExist) {
++		return data, nil
++	}
++	if err != nil {
++		return nil, fmt.Errorf("read pending store %s: %w", s.path, err)
++	}
++	if err := json.Unmarshal(raw, data); err != nil {
++		quarantined := fmt.Sprintf("%s.corrupt-%s", s.path, time.Now().Format("20060102T150405.000000000"))
++		if renameErr := os.Rename(s.path, quarantined); renameErr != nil {
++			s.logger.Error().Err(renameErr).Str("path", s.path).Msg("could not quarantine corrupt pending store")
++			return nil, fmt.Errorf("parse pending store %s: %w", s.path, err)
++		}
++		s.logger.Warn().Err(err).Str("path", s.path).Str("quarantined", quarantined).
++			Msg("pending store was corrupt and has been quarantined, pending spaces are rebuilt on demand")
++		return &pendingStoreData{Version: _pendingStoreVersion, Spaces: map[string]pendingSpace{}}, nil
++	}
++	if data.Spaces == nil {
++		data.Spaces = map[string]pendingSpace{}
++	}
++	return data, nil
++}
++
++// saveLocked encodes and atomically replaces the store file. The caller must
++// hold the file lock, which also makes the remove-and-rename fallback on
++// Windows safe against concurrent readers/writers.
++func (s *filePendingStore) saveLocked(data *pendingStoreData) error {
++	data.Version = _pendingStoreVersion
++	raw, err := json.MarshalIndent(data, "", "  ")
++	if err != nil {
++		return fmt.Errorf("encode pending store: %w", err)
++	}
++
++	dir := filepath.Dir(s.path)
++	tmp, err := os.CreateTemp(dir, ".pending-*.tmp")
++	if err != nil {
++		return fmt.Errorf("create temporary pending store: %w", err)
++	}
++	tmpName := tmp.Name()
++	defer func() { _ = os.Remove(tmpName) }()
++
++	if _, err = tmp.Write(raw); err != nil {
++		_ = tmp.Close()
++		return fmt.Errorf("write temporary pending store: %w", err)
++	}
++	if err = tmp.Sync(); err != nil {
++		_ = tmp.Close()
++		return fmt.Errorf("flush temporary pending store: %w", err)
++	}
++	if err = tmp.Close(); err != nil {
++		return fmt.Errorf("close temporary pending store: %w", err)
++	}
++
++	if err = os.Rename(tmpName, s.path); err != nil {
++		// On some Windows versions os.Rename cannot replace an existing file.
++		// The store lock guarantees no other process touches the file.
++		if runtime.GOOS == "windows" {
++			if removeErr := os.Remove(s.path); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
++				return fmt.Errorf("replace pending store: %w", err)
++			}
++			if err = os.Rename(tmpName, s.path); err != nil {
++				return fmt.Errorf("replace pending store: %w", err)
++			}
++		} else {
++			return fmt.Errorf("replace pending store: %w", err)
++		}
++	}
++	return nil
++}
++
++// spaceLocker serializes index runs of one space across consumers and
++// instances.
++type spaceLocker interface {
++	// tryLock attempts to acquire the rebuild lock without blocking.
++	// ok is false when another consumer or instance currently rebuilds the
++	// space; release must only be called when ok is true.
++	tryLock(spaceID string) (release func(), ok bool, err error)
++	// lock acquires the rebuild lock, waiting for other processes. It honors
++	// ctx for manual index requests that carry a deadline.
++	lock(ctx context.Context, spaceID string) (release func(), err error)
++}
++
++// nopSpaceLocker is used together with the memory store: the debouncer's
++// in-process guards already serialize consumers within one instance.
++type nopSpaceLocker struct{}
++
++func (nopSpaceLocker) tryLock(string) (func(), bool, error) {
++	return func() {}, true, nil
++}
++
++func (nopSpaceLocker) lock(context.Context, string) (func(), error) {
++	return func() {}, nil
++}
++
++// fileSpaceLocker uses one flock file per space so that, in scaled
++// deployments, two search instances cannot rebuild and publish the same space
++// concurrently. Locks are released automatically by the OS if a process
++// crashes, letting the next startup or another instance take over.
++type fileSpaceLocker struct {
++	dir string
++
++	mu     sync.Mutex
++	flocks map[string]*flock.Flock
++}
++
++func newFileSpaceLocker(datapath string) (*fileSpaceLocker, error) {
++	dir := filepath.Join(datapath, _pendingLocksDir)
++	if err := os.MkdirAll(dir, 0o700); err != nil {
++		return nil, fmt.Errorf("create space lock directory %s: %w", dir, err)
++	}
++	return &fileSpaceLocker{
++		dir:    dir,
++		flocks: map[string]*flock.Flock{},
++	}, nil
++}
++
++func (l *fileSpaceLocker) pathFor(spaceID string) string {
++	// Space ids are opaque and may contain characters that are awkward in
++	// file names, so use a hex encoded, file system safe name.
++	name := hex.EncodeToString([]byte(spaceID)) + ".lock"
++	return filepath.Join(l.dir, name)
++}
++
++func (l *fileSpaceLocker) flockFor(spaceID string) *flock.Flock {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++
++	// flock files are never removed, so keying by the file name is enough.
++	key := l.pathFor(spaceID)
++	if f, ok := l.flocks[key]; ok {
++		return f
++	}
++	f := flock.New(key)
++	l.flocks[key] = f
++	return f
++}
++
++func (l *fileSpaceLocker) tryLock(spaceID string) (func(), bool, error) {
++	f := l.flockFor(spaceID)
++	ok, err := f.TryLock()
++	if err != nil {
++		return nil, false, fmt.Errorf("acquire space lock: %w", err)
++	}
++	if !ok {
++		return nil, false, nil
++	}
++	return func() { _ = f.Unlock() }, true, nil
++}
++
++func (l *fileSpaceLocker) lock(ctx context.Context, spaceID string) (func(), error) {
++	f := l.flockFor(spaceID)
++	for {
++		ok, err := f.TryLock()
++		if err != nil {
++			return nil, fmt.Errorf("acquire space lock: %w", err)
++		}
++		if ok {
++			return func() { _ = f.Unlock() }, nil
++		}
++		select {
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		case <-time.After(50 * time.Millisecond):
++		}
++	}
++}
++
++// sortedSpaceIDs returns the keys of m sorted. Sorting makes startup recovery
++// deterministic.
++func sortedSpaceIDs(m map[string]pendingSpace) []string {
++	ids := make([]string, 0, len(m))
++	for id := range m {
++		ids = append(ids, id)
++	}
++	sort.Strings(ids)
++	return ids
++}
+diff --git a/services/search/pkg/search/pending_store_internal_test.go b/services/search/pkg/search/pending_store_internal_test.go
+new file mode 100644
+index 00000000..d77f4745
+--- /dev/null
++++ b/services/search/pkg/search/pending_store_internal_test.go
+@@ -0,0 +1,215 @@
++package search
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	sprovider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
++
++	"github.com/owncloud/ocis/v2/ocis-pkg/log"
++)
++
++func TestMemoryPendingStoreGenerations(t *testing.T) {
++	s := newMemoryPendingStore()
++
++	gen, err := s.Add("space")
++	if err != nil || gen != 1 {
++		t.Fatalf("first Add: gen=%d err=%v", gen, err)
++	}
++	gen, err = s.Add("space")
++	if err != nil || gen != 2 {
++		t.Fatalf("second Add: gen=%d err=%v", gen, err)
++	}
++
++	// An older generation cannot clear a newer one.
++	cleared, err := s.Done("space", 1)
++	if err != nil || cleared {
++		t.Fatalf("stale Done: cleared=%v err=%v", cleared, err)
++	}
++	pending, _ := s.List()
++	if len(pending) != 1 {
++		t.Fatalf("space must stay pending after a stale completion, got %v", pending)
++	}
++
++	cleared, err = s.Done("space", 2)
++	if err != nil || !cleared {
++		t.Fatalf("latest Done: cleared=%v err=%v", cleared, err)
++	}
++	pending, _ = s.List()
++	if len(pending) != 0 {
++		t.Fatalf("space must be cleared after the latest completion, got %v", pending)
++	}
++
++	// A repeated completion of the same generation must not resurrect state.
++	cleared, err = s.Done("space", 2)
++	if err != nil || cleared {
++		t.Fatalf("duplicate Done: cleared=%v err=%v", cleared, err)
++	}
++}
++
++func TestFilePendingStorePersistsAcrossInstances(t *testing.T) {
++	dir := t.TempDir()
++
++	s1, err := newFilePendingStore(dir, log.NopLogger())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if gen, err := s1.Add("space-a"); err != nil || gen != 1 {
++		t.Fatalf("Add space-a: gen=%d err=%v", gen, err)
++	}
++	if gen, err := s1.Add("space-b"); err != nil || gen != 1 {
++		t.Fatalf("Add space-b: gen=%d err=%v", gen, err)
++	}
++	if gen, err := s1.Add("space-a"); err != nil || gen != 2 {
++		t.Fatalf("second Add space-a: gen=%d err=%v", gen, err)
++	}
++
++	// The change is durable before any timer fires.
++	raw, err := os.ReadFile(filepath.Join(dir, _pendingStoreFile))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !strings.Contains(string(raw), "space-a") || !strings.Contains(string(raw), "space-b") {
++		t.Fatalf("pending spaces not persisted: %s", raw)
++	}
++
++	// Simulate a restart: a new instance sees exactly the persisted state.
++	s2, err := newFilePendingStore(dir, log.NopLogger())
++	if err != nil {
++		t.Fatal(err)
++	}
++	pending, err := s2.List()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(pending) != 2 || pending["space-a"].Generation != 2 || pending["space-b"].Generation != 1 {
++		t.Fatalf("recovered state mismatch: %+v", pending)
++	}
++
++	// Completion from the new instance is visible to the old one.
++	cleared, err := s2.Done("space-a", 2)
++	if err != nil || !cleared {
++		t.Fatalf("Done from s2: cleared=%v err=%v", cleared, err)
++	}
++	pending, _ = s1.List()
++	if _, ok := pending["space-a"]; ok {
++		t.Fatalf("space-a should be gone for s1 as well: %+v", pending)
++	}
++	if _, ok := pending["space-b"]; !ok {
++		t.Fatal("space-b should still be pending")
++	}
++
++	// A stale generation from a finished run cannot remove newer pending state.
++	cleared, err = s1.Done("space-b", 42)
++	if err != nil || cleared {
++		t.Fatalf("stale Done across instances: cleared=%v err=%v", cleared, err)
++	}
++}
++
++func TestFilePendingStoreQuarantinesCorruptFile(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, _pendingStoreFile)
++	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++
++	s, err := newFilePendingStore(dir, log.NopLogger())
++	if err != nil {
++		t.Fatal(err)
++	}
++	pending, err := s.List()
++	if err != nil {
++		t.Fatalf("corrupt store should be quarantined, not fatal: %v", err)
++	}
++	if len(pending) != 0 {
++		t.Fatalf("expected empty recovered store, got %v", pending)
++	}
++	if gen, err := s.Add("space"); err != nil || gen != 1 {
++		t.Fatalf("Add after quarantine: gen=%d err=%v", gen, err)
++	}
++}
++
++func TestFileSpaceLockerSerializesAcrossInstances(t *testing.T) {
++	dir := t.TempDir()
++	l1, err := newFileSpaceLocker(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	l2, err := newFileSpaceLocker(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	release, ok, err := l1.tryLock("space-a")
++	if err != nil || !ok {
++		t.Fatalf("first tryLock: ok=%v err=%v", ok, err)
++	}
++
++	if _, ok, err := l2.tryLock("space-a"); err != nil || ok {
++		t.Fatalf("second tryLock must fail while held: ok=%v err=%v", ok, err)
++	}
++
++	// A different space is unaffected.
++	relOther, ok, err := l2.tryLock("space-other")
++	if err != nil || !ok {
++		t.Fatalf("other space lock: ok=%v err=%v", ok, err)
++	}
++	relOther()
++
++	// Blocking lock waits for the holder and honors the context.
++	ctx, cancel := context.WithCancel(context.Background())
++	blocked := make(chan error, 1)
++	go func() {
++		rel, err := l2.lock(ctx, "space-a")
++		if err == nil {
++			rel()
++		}
++		blocked <- err
++	}()
++	select {
++	case err := <-blocked:
++		t.Fatalf("lock should block, returned early: %v", err)
++	case <-time.After(100 * time.Millisecond):
++	}
++	cancel()
++	select {
++	case err := <-blocked:
++		if err == nil {
++			t.Fatal("expected context cancellation error")
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("blocked lock did not react to context cancellation")
++	}
++
++	release()
++
++	rel2, err := l2.lock(context.Background(), "space-a")
++	if err != nil {
++		t.Fatalf("lock after release: %v", err)
++	}
++	rel2()
++}
++
++// TestPersistentDebouncerWiresFileStore is a compile-time guard that the
++// persistent constructor wires the file based store and locker.
++func TestPersistentDebouncerWiresFileStore(t *testing.T) {
++	dir := t.TempDir()
++	d, err := NewPersistentSpaceDebouncer(time.Hour, func(_ context.Context, _ *sprovider.StorageSpaceId) error {
++		return nil
++	}, dir, log.NopLogger())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer func() { _ = d.Close(context.Background()) }()
++
++	if _, ok := d.store.(*filePendingStore); !ok {
++		t.Fatalf("expected filePendingStore, got %T", d.store)
++	}
++	if _, ok := d.locks.(*fileSpaceLocker); !ok {
++		t.Fatalf("expected fileSpaceLocker, got %T", d.locks)
++	}
++}
+diff --git a/services/search/pkg/search/service.go b/services/search/pkg/search/service.go
+index 81333bd2..c408848a 100644
+--- a/services/search/pkg/search/service.go
++++ b/services/search/pkg/search/service.go
+@@ -73,12 +73,21 @@ type Service struct {
+ 	engine          engine.Engine
+ 	extractor       content.Extractor
+ 
++	// indexer persists and serializes scheduled space rebuilds. It is nil
++	// without a persistent data path, in which case rebuilds run directly.
++	indexer *SpaceDebouncer
++
+ 	serviceAccountID     string
+ 	serviceAccountSecret string
+ }
+ 
+ var errSkipSpace error
+ 
++// _indexerShutdownGrace bounds how long a graceful shutdown waits for space
++// walks that are already running. Runs which do not finish in time stay
++// pending in the persistent store and are resumed by the next startup.
++const _indexerShutdownGrace = 30 * time.Second
++
+ // NewService creates a new Provider instance.
+ func NewService(gatewaySelector pool.Selectable[gateway.GatewayAPIClient], eng engine.Engine, extractor content.Extractor, logger log.Logger, cfg *config.Config) *Service {
+ 	var s = &Service{
+@@ -91,9 +100,48 @@ func NewService(gatewaySelector pool.Selectable[gateway.GatewayAPIClient], eng e
+ 		serviceAccountSecret: cfg.ServiceAccount.ServiceAccountSecret,
+ 	}
+ 
++	// A persistent data path enables crash-safe pending spaces and
++	// cross-instance serialization of space rebuilds.
++	if cfg.Engine.Bleve.Datapath != "" {
++		debounce := time.Duration(cfg.Events.DebounceDuration) * time.Millisecond
++		indexer, err := NewPersistentSpaceDebouncer(debounce, s.indexSpace, cfg.Engine.Bleve.Datapath, logger)
++		if err != nil {
++			logger.Error().Err(err).Msg("could not initialize persistent space indexer, pending index updates will not survive restarts")
++		} else {
++			s.indexer = indexer
++		}
++	}
++
+ 	return s
+ }
+ 
++// StartSpaceIndexer re-arms index runs for spaces still pending from a
++// previous run. It does not scan spaces on its own: only persisted pending
++// spaces are scheduled.
++func (s *Service) StartSpaceIndexer() {
++	if s.indexer != nil {
++		s.indexer.Start()
++	}
++}
++
++// ShutdownSpaceIndexer stops index timers and waits for started space walks,
++// bounded by a fixed grace period. Unfinished or pending work stays persisted
++// for the next startup.
++func (s *Service) ShutdownSpaceIndexer() error {
++	if s.indexer == nil {
++		return nil
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), _indexerShutdownGrace)
++	defer cancel()
++	return s.indexer.Close(ctx)
++}
++
++// spaceIndexer exposes the persistent debouncer so the event consumer can
++// reuse the same instance as manual index requests.
++func (s *Service) spaceIndexer() *SpaceDebouncer {
++	return s.indexer
++}
++
+ // Search processes a search request and passes it down to the engine.
+ func (s *Service) Search(ctx context.Context, req *searchsvc.SearchRequest) (*searchsvc.SearchResponse, error) {
+ 	s.logger.Debug().Str("query", req.Query).Msg("performing a search")
+@@ -463,7 +511,21 @@ const (
+ )
+ 
+ // IndexSpace (re)indexes all resources of a given space.
++//
++// When the persistent indexer is available the call runs under the same
++// per-space serialization and pending-generation handling as automatic
++// updates, so a manual rebuild that covers the pending generation clears it
++// and converges to the same index the automatic recovery would produce.
+ func (s *Service) IndexSpace(ctx context.Context, spaceID *provider.StorageSpaceId) error {
++	if s.indexer != nil {
++		return s.indexer.RunIndex(ctx, spaceID)
++	}
++	return s.indexSpace(ctx, spaceID)
++}
++
++// indexSpace walks the given space and indexes all of its resources. It is
++// the raw rebuild executed by both the debouncer and manual requests.
++func (s *Service) indexSpace(ctx context.Context, spaceID *provider.StorageSpaceId) error {
+ 	ownerCtx, err := getAuthContext(ctx, s.serviceAccountID, s.gatewaySelector, s.serviceAccountSecret, s.logger)
+ 	if err != nil {
+ 		return err
+diff --git a/services/search/pkg/search/service_indexer_test.go b/services/search/pkg/search/service_indexer_test.go
+new file mode 100644
+index 00000000..776f1553
+--- /dev/null
++++ b/services/search/pkg/search/service_indexer_test.go
+@@ -0,0 +1,158 @@
++package search_test
++
++import (
++	"context"
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"sync/atomic"
++	"time"
++
++	gateway "github.com/cs3org/go-cs3apis/cs3/gateway/v1beta1"
++	userv1beta1 "github.com/cs3org/go-cs3apis/cs3/identity/user/v1beta1"
++	sprovider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
++	typesv1beta1 "github.com/cs3org/go-cs3apis/cs3/types/v1beta1"
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++	"github.com/owncloud/reva/v2/pkg/rgrpc/status"
++	"github.com/owncloud/reva/v2/pkg/rgrpc/todo/pool"
++	cs3mocks "github.com/owncloud/reva/v2/tests/cs3mocks/mocks"
++	"github.com/stretchr/testify/mock"
++	"google.golang.org/grpc"
++
++	"github.com/owncloud/ocis/v2/ocis-pkg/log"
++	"github.com/owncloud/ocis/v2/services/search/pkg/config"
++	"github.com/owncloud/ocis/v2/services/search/pkg/content"
++	contentMocks "github.com/owncloud/ocis/v2/services/search/pkg/content/mocks"
++	"github.com/owncloud/ocis/v2/services/search/pkg/engine"
++	engineMocks "github.com/owncloud/ocis/v2/services/search/pkg/engine/mocks"
++	"github.com/owncloud/ocis/v2/services/search/pkg/search"
++)
++
++var _ = Describe("Service space indexer", func() {
++	var (
++		datapath        string
++		extractor       *contentMocks.Extractor
++		gatewayClient   *cs3mocks.GatewayAPIClient
++		gatewaySelector pool.Selectable[gateway.GatewayAPIClient]
++		indexClient     *engineMocks.Engine
++		logger          = log.NewLogger()
++		user            = &userv1beta1.User{
++			Id: &userv1beta1.UserId{
++				OpaqueId: "user",
++			},
++		}
++		ri = &sprovider.ResourceInfo{
++			Id: &sprovider.ResourceId{
++				StorageId: "storageid",
++				SpaceId:   "spaceid",
++				OpaqueId:  "opaqueid",
++			},
++			ParentId: &sprovider.ResourceId{
++				StorageId: "storageid",
++				SpaceId:   "spaceid",
++				OpaqueId:  "parentopaqueid",
++			},
++			Path:  "./foo.pdf",
++			Size:  12345,
++			Mtime: &typesv1beta1.Timestamp{Seconds: 4000},
++		}
++	)
++
++	BeforeEach(func() {
++		var err error
++		datapath, err = os.MkdirTemp("", "search-service-")
++		Expect(err).ToNot(HaveOccurred())
++
++		pool.RemoveSelector("GatewaySelector" + "com.owncloud.api.gateway")
++		gatewayClient = &cs3mocks.GatewayAPIClient{}
++		gatewaySelector = pool.GetSelector[gateway.GatewayAPIClient](
++			"GatewaySelector",
++			"com.owncloud.api.gateway",
++			func(cc grpc.ClientConnInterface) gateway.GatewayAPIClient {
++				return gatewayClient
++			},
++		)
++
++		indexClient = &engineMocks.Engine{}
++		extractor = &contentMocks.Extractor{}
++
++		gatewayClient.On("Authenticate", mock.Anything, mock.Anything).Return(&gateway.AuthenticateResponse{
++			Status: status.NewOK(context.Background()),
++			Token:  "authtoken",
++		}, nil)
++	})
++
++	AfterEach(func() {
++		_ = os.RemoveAll(datapath)
++	})
++
++	It("does not scan any space on idle startup when nothing is pending", func() {
++		cfg := &config.Config{
++			Engine: config.Engine{Bleve: config.EngineBleve{Datapath: datapath}},
++		}
++		s := search.NewService(gatewaySelector, indexClient, extractor, logger, cfg)
++
++		s.StartSpaceIndexer()
++		Expect(s.ShutdownSpaceIndexer()).To(Succeed())
++
++		gatewayClient.AssertNotCalled(GinkgoT(), "Stat", mock.Anything, mock.Anything)
++		indexClient.AssertNotCalled(GinkgoT(), "Upsert", mock.Anything, mock.Anything)
++	})
++
++	It("recovers pending spaces on startup and clears them through a manual IndexSpace", func() {
++		// Simulate a previous instance that accepted a change and was stopped
++		// inside the debounce window.
++		seeder, err := search.NewPersistentSpaceDebouncer(time.Hour, func(_ context.Context, _ *sprovider.StorageSpaceId) error {
++			return nil
++		}, datapath, logger)
++		Expect(err).ToNot(HaveOccurred())
++		seeder.Debounce(context.Background(), &sprovider.StorageSpaceId{OpaqueId: "storageid$spaceid!spaceid"})
++		Expect(seeder.Close(context.Background())).To(Succeed())
++
++		cfg := &config.Config{
++			Engine: config.Engine{Bleve: config.EngineBleve{Datapath: datapath}},
++			Events: config.Events{DebounceDuration: 60 * 60 * 1000}, // 1h, automatic runs must not interfere
++		}
++		s := search.NewService(gatewaySelector, indexClient, extractor, logger, cfg)
++		s.StartSpaceIndexer() // loads the pending space without scanning it
++
++		var upserts atomic.Int32
++		gatewayClient.On("GetUserByClaim", mock.Anything, mock.Anything).Return(&userv1beta1.GetUserByClaimResponse{
++			Status: status.NewOK(context.Background()),
++			User:   user,
++		}, nil)
++		extractor.On("Extract", mock.Anything, mock.Anything, mock.Anything).Return(content.Document{}, nil)
++		indexClient.On("Upsert", mock.Anything, mock.Anything).Run(func(_ mock.Arguments) {
++			upserts.Add(1)
++		}).Return(nil)
++		indexClient.On("Lookup", mock.Anything).Return(nil, engine.ErrResourceNotFound)
++		indexClient.On("DocCount").Return(uint64(1), nil)
++		gatewayClient.On("Stat", mock.Anything, mock.MatchedBy(func(req *sprovider.StatRequest) bool {
++			return req.Ref.ResourceId.StorageId == "storageid" &&
++				req.Ref.ResourceId.OpaqueId == "spaceid" &&
++				req.Ref.ResourceId.SpaceId == "spaceid"
++		})).Return(&sprovider.StatResponse{
++			Status: status.NewOK(context.Background()),
++			Info:   ri,
++		}, nil)
++
++		// The manual rebuild covers the pending generation.
++		Expect(s.IndexSpace(context.Background(), &sprovider.StorageSpaceId{OpaqueId: "storageid$spaceid!spaceid"})).
++			To(Succeed())
++		Expect(int(upserts.Load())).To(Equal(1))
++
++		raw, err := os.ReadFile(filepath.Join(datapath, "pending_spaces.json"))
++		Expect(err).ToNot(HaveOccurred())
++		var data struct {
++			Spaces map[string]json.RawMessage `json:"spaces"`
++		}
++		Expect(json.Unmarshal(raw, &data)).To(Succeed())
++		Expect(data.Spaces).To(BeEmpty())
++
++		// No automatic follow-up run is scheduled after the pending generation
++		// was covered.
++		Consistently(func() int { return int(upserts.Load()) }, "200ms", "20ms").Should(Equal(1))
++		Expect(s.ShutdownSpaceIndexer()).To(Succeed())
++	})
++})
+diff --git a/services/search/pkg/service/grpc/v0/service.go b/services/search/pkg/service/grpc/v0/service.go
+index dcc41456..4675e0e9 100644
+--- a/services/search/pkg/service/grpc/v0/service.go
++++ b/services/search/pkg/service/grpc/v0/service.go
+@@ -86,6 +86,19 @@ func NewHandler(opts ...Option) (searchsvc.SearchProviderHandler, func(), error)
+ 
+ 	ss := search.NewService(selector, eng, extractor, logger, cfg)
+ 
++	// Resume spaces that were still pending when a previous instance stopped.
++	// Only persisted pending spaces are scheduled, an idle startup does not
++	// scan all spaces.
++	ss.StartSpaceIndexer()
++
++	// Stop the space indexer (waiting for started walks or leaving them
++	// pending for the next startup) before the engine underneath is closed.
++	prevTeardown := teardown
++	teardown = func() {
++		_ = ss.ShutdownSpaceIndexer()
++		prevTeardown()
++	}
++
+ 	// setup event handling
+ 	if err := search.HandleEvents(ss, bus, logger, cfg); err != nil {
+ 		return nil, teardown, err

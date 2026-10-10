@@ -1,0 +1,9 @@
+项目：owncloud-ocis-9d3ed939-1f36-4961-a37c-9da291a69fab｜搜索防抖任务的重启续作
+Session：6ac997b8a4393268b21cc2f5｜有效轮数：68｜完成度：部分完成｜收录：难题
+Rubric ID：1｜状态：通过｜期望行为：现有移动、删除、恢复、上传、改名、默认防抖和异步上传保持兼容。｜实际观察：事件分支继续先执行原即时 MoveItem、TrashItem、RestoreItem、UpdateTags，再登记空间防抖；默认配置与上传选择未改。｜直接证据：services/search/pkg/search/events.go:88-130；go test -count=1 及连续三次无缓存测试通过。
+Rubric ID：2｜状态：通过｜期望行为：防抖窗口崩溃后只恢复持久待处理空间并收敛，空闲启动不全扫。｜实际观察：Debounce 先写 pending_spaces.json 再启动 timer，Start 仅枚举持久 pending map；重建成功按代次清除。｜直接证据：services/search/pkg/search/debouncer.go:100-124、169-198；debouncer_persistent_test.go 重启恢复用例通过。
+Rubric ID：3｜状态：通过｜期望行为：优雅关闭完成已开始任务或留下可接管状态，重启不丢任务。｜实际观察：Close 停止 timer 并等待已登记 WaitGroup，成功完成在 pending 状态落盘后才 Done；超时任务保留持久 pending。｜直接证据：services/search/pkg/search/debouncer.go:200-225、299-343；优雅关闭测试通过。
+Rubric ID：4｜状态：通过｜期望行为：连续事件合并且旧重建不能清除执行期新代次。｜实际观察：每次 Debounce 原子增加 generation，Done 仅在存储代次等于开始代次时清除；发现新代次后安排后续重建。｜直接证据：services/search/pkg/search/pending_store.go:178-220；services/search/pkg/search/debouncer.go:346-417；执行期变化测试通过。
+Rubric ID：5｜状态：通过｜期望行为：遍历或提交失败保留待处理和可观察错误，成功覆盖代次后才清除。｜实际观察：indexFunc 返回错误时增加失败次数、记录 error 并保留 pending，按封顶退避重试；成功后才调用 Done。｜直接证据：services/search/pkg/search/debouncer.go:349-375；失败后新实例恢复测试通过。
+Rubric ID：6｜状态：未通过｜期望行为：多消费者、多实例及手动与自动交错时，每个代次最多一个有效执行者提交并最终一致。｜实际观察：go test -race -count=1 的双实例用例在两次代次登记后观察到 runs=3，测试要求 runs 不超过 2 并失败；代码在未获得跨实例锁时按本地 gens 继续定时重试。｜直接证据：race 输出 Persistent SpaceDebouncer 用例失败，debouncer_persistent_test.go:234-272；services/search/pkg/search/debouncer.go:320-329。｜原因：双实例 race 验证两次代次登记触发了三次重建执行｜影响：同一空间的已覆盖代次会被额外执行和提交，违反每代次最多一个有效执行者并增加旧结果覆盖新状态的窗口｜证据位置：services/search/pkg/search/debouncer_persistent_test.go:272
+验证摘要：go test -count=1 ./services/search/pkg/search 通过；连续三次无缓存测试通过；go test -race -count=1 复现双实例用例 runs=3 的确定失败。

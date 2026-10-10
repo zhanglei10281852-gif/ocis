@@ -73,11 +73,20 @@ type Service struct {
 	engine          engine.Engine
 	extractor       content.Extractor
 
+	// indexer persists and serializes scheduled space rebuilds. It is nil
+	// without a persistent data path, in which case rebuilds run directly.
+	indexer *SpaceDebouncer
+
 	serviceAccountID     string
 	serviceAccountSecret string
 }
 
 var errSkipSpace error
+
+// _indexerShutdownGrace bounds how long a graceful shutdown waits for space
+// walks that are already running. Runs which do not finish in time stay
+// pending in the persistent store and are resumed by the next startup.
+const _indexerShutdownGrace = 30 * time.Second
 
 // NewService creates a new Provider instance.
 func NewService(gatewaySelector pool.Selectable[gateway.GatewayAPIClient], eng engine.Engine, extractor content.Extractor, logger log.Logger, cfg *config.Config) *Service {
@@ -91,7 +100,46 @@ func NewService(gatewaySelector pool.Selectable[gateway.GatewayAPIClient], eng e
 		serviceAccountSecret: cfg.ServiceAccount.ServiceAccountSecret,
 	}
 
+	// A persistent data path enables crash-safe pending spaces and
+	// cross-instance serialization of space rebuilds.
+	if cfg.Engine.Bleve.Datapath != "" {
+		debounce := time.Duration(cfg.Events.DebounceDuration) * time.Millisecond
+		indexer, err := NewPersistentSpaceDebouncer(debounce, s.indexSpace, cfg.Engine.Bleve.Datapath, logger)
+		if err != nil {
+			logger.Error().Err(err).Msg("could not initialize persistent space indexer, pending index updates will not survive restarts")
+		} else {
+			s.indexer = indexer
+		}
+	}
+
 	return s
+}
+
+// StartSpaceIndexer re-arms index runs for spaces still pending from a
+// previous run. It does not scan spaces on its own: only persisted pending
+// spaces are scheduled.
+func (s *Service) StartSpaceIndexer() {
+	if s.indexer != nil {
+		s.indexer.Start()
+	}
+}
+
+// ShutdownSpaceIndexer stops index timers and waits for started space walks,
+// bounded by a fixed grace period. Unfinished or pending work stays persisted
+// for the next startup.
+func (s *Service) ShutdownSpaceIndexer() error {
+	if s.indexer == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), _indexerShutdownGrace)
+	defer cancel()
+	return s.indexer.Close(ctx)
+}
+
+// spaceIndexer exposes the persistent debouncer so the event consumer can
+// reuse the same instance as manual index requests.
+func (s *Service) spaceIndexer() *SpaceDebouncer {
+	return s.indexer
 }
 
 // Search processes a search request and passes it down to the engine.
@@ -463,7 +511,21 @@ const (
 )
 
 // IndexSpace (re)indexes all resources of a given space.
+//
+// When the persistent indexer is available the call runs under the same
+// per-space serialization and pending-generation handling as automatic
+// updates, so a manual rebuild that covers the pending generation clears it
+// and converges to the same index the automatic recovery would produce.
 func (s *Service) IndexSpace(ctx context.Context, spaceID *provider.StorageSpaceId) error {
+	if s.indexer != nil {
+		return s.indexer.RunIndex(ctx, spaceID)
+	}
+	return s.indexSpace(ctx, spaceID)
+}
+
+// indexSpace walks the given space and indexes all of its resources. It is
+// the raw rebuild executed by both the debouncer and manual requests.
+func (s *Service) indexSpace(ctx context.Context, spaceID *provider.StorageSpaceId) error {
 	ownerCtx, err := getAuthContext(ctx, s.serviceAccountID, s.gatewaySelector, s.serviceAccountSecret, s.logger)
 	if err != nil {
 		return err

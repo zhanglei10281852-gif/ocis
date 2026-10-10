@@ -13,6 +13,13 @@ import (
 	"github.com/owncloud/reva/v2/pkg/storagespace"
 )
 
+// spaceIndexerProvider is implemented by searchers that own a persistent
+// SpaceDebouncer. It lets the event consumer reuse the same debouncer (and
+// therefore pending generations and locks) as manual IndexSpace calls.
+type spaceIndexerProvider interface {
+	spaceIndexer() *SpaceDebouncer
+}
+
 // HandleEvents listens to the needed events,
 // it handles the whole resource indexing livecycle.
 func HandleEvents(s Searcher, bus events.Consumer, logger log.Logger, cfg *config.Config) error {
@@ -54,11 +61,26 @@ func HandleEvents(s Searcher, bus events.Consumer, logger log.Logger, cfg *confi
 		}
 	}
 
-	indexSpaceDebouncer := NewSpaceDebouncer(time.Duration(cfg.Events.DebounceDuration)*time.Millisecond, func(ctx context.Context, id *provider.StorageSpaceId) {
-		if err := s.IndexSpace(ctx, id); err != nil {
-			logger.Error().Err(err).Interface("spaceID", id).Msg("error while indexing a space")
-		}
-	})
+	// Reuse the search service's persistent debouncer when available so that
+	// event-triggered and manual rebuilds share pending generations, per-space
+	// serialization and crash recovery. Searchers without a persistent data
+	// path (e.g. in tests) fall back to the in-memory debouncer.
+	var indexSpaceDebouncer *SpaceDebouncer
+	if idxProvider, ok := s.(spaceIndexerProvider); ok {
+		indexSpaceDebouncer = idxProvider.spaceIndexer()
+	}
+	if indexSpaceDebouncer == nil {
+		indexSpaceDebouncer = NewSpaceDebouncer(time.Duration(cfg.Events.DebounceDuration)*time.Millisecond, func(ctx context.Context, id *provider.StorageSpaceId) {
+			if err := s.IndexSpace(ctx, id); err != nil {
+				logger.Error().Err(err).Interface("spaceID", id).Msg("error while indexing a space")
+			}
+		})
+	} else {
+		// Recover spaces that were still pending when a previous instance
+		// stopped. Only persisted pending spaces are scheduled, an idle
+		// startup never scans all spaces.
+		indexSpaceDebouncer.Start()
+	}
 
 	// trace provider is available here, otherwise the search service should have crashed
 	tp, _ := tracing.GetServiceTraceProvider(cfg.Tracing, cfg.Service.Name)

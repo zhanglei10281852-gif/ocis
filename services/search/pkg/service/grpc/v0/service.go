@@ -86,6 +86,19 @@ func NewHandler(opts ...Option) (searchsvc.SearchProviderHandler, func(), error)
 
 	ss := search.NewService(selector, eng, extractor, logger, cfg)
 
+	// Resume spaces that were still pending when a previous instance stopped.
+	// Only persisted pending spaces are scheduled, an idle startup does not
+	// scan all spaces.
+	ss.StartSpaceIndexer()
+
+	// Stop the space indexer (waiting for started walks or leaving them
+	// pending for the next startup) before the engine underneath is closed.
+	prevTeardown := teardown
+	teardown = func() {
+		_ = ss.ShutdownSpaceIndexer()
+		prevTeardown()
+	}
+
 	// setup event handling
 	if err := search.HandleEvents(ss, bus, logger, cfg); err != nil {
 		return nil, teardown, err
