@@ -1,0 +1,1471 @@
+diff --git a/protogen/gen/ocis/services/eventhistory/v0/eventhistory.pb.go b/protogen/gen/ocis/services/eventhistory/v0/eventhistory.pb.go
+index 880b0a33..bcc1189b 100644
+--- a/protogen/gen/ocis/services/eventhistory/v0/eventhistory.pb.go
++++ b/protogen/gen/ocis/services/eventhistory/v0/eventhistory.pb.go
+@@ -22,6 +22,66 @@ const (
+ 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
+ )
+ 
++// EventLookupState describes the outcome of looking up a single event body.
++type EventLookupState int32
++
++const (
++	// unspecified, unused
++	EventLookupState_EVENT_LOOKUP_STATE_UNSPECIFIED EventLookupState = 0
++	// no event with the requested id is currently stored; the event body may
++	// still be on its way into the store or may have expired
++	EventLookupState_EVENT_LOOKUP_STATE_NOT_FOUND EventLookupState = 1
++	// the stored event payload is corrupt and cannot be decoded, the record
++	// is considered permanently lost
++	EventLookupState_EVENT_LOOKUP_STATE_CORRUPT EventLookupState = 2
++	// reading the event failed because of a transient storage backend error,
++	// the event must be considered potentially available
++	EventLookupState_EVENT_LOOKUP_STATE_READ_FAILED EventLookupState = 3
++)
++
++// Enum value maps for EventLookupState.
++var (
++	EventLookupState_name = map[int32]string{
++		0: "EVENT_LOOKUP_STATE_UNSPECIFIED",
++		1: "EVENT_LOOKUP_STATE_NOT_FOUND",
++		2: "EVENT_LOOKUP_STATE_CORRUPT",
++		3: "EVENT_LOOKUP_STATE_READ_FAILED",
++	}
++	EventLookupState_value = map[string]int32{
++		"EVENT_LOOKUP_STATE_UNSPECIFIED": 0,
++		"EVENT_LOOKUP_STATE_NOT_FOUND":   1,
++		"EVENT_LOOKUP_STATE_CORRUPT":     2,
++		"EVENT_LOOKUP_STATE_READ_FAILED": 3,
++	}
++)
++
++func (x EventLookupState) Enum() *EventLookupState {
++	p := new(EventLookupState)
++	*p = x
++	return p
++}
++
++func (x EventLookupState) String() string {
++	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
++}
++
++func (EventLookupState) Descriptor() protoreflect.EnumDescriptor {
++	return file_ocis_services_eventhistory_v0_eventhistory_proto_enumTypes[0].Descriptor()
++}
++
++func (EventLookupState) Type() protoreflect.EnumType {
++	return &file_ocis_services_eventhistory_v0_eventhistory_proto_enumTypes[0]
++}
++
++func (x EventLookupState) Number() protoreflect.EnumNumber {
++	return protoreflect.EnumNumber(x)
++}
++
++// Deprecated: Use EventLookupState.Descriptor instead.
++func (EventLookupState) EnumDescriptor() ([]byte, []int) {
++	return file_ocis_services_eventhistory_v0_eventhistory_proto_rawDescGZIP(), []int{0}
++}
++
+ // A request to retrieve events
+ type GetEventsRequest struct {
+ 	state         protoimpl.MessageState
+@@ -127,6 +187,10 @@ type GetEventsResponse struct {
+ 	unknownFields protoimpl.UnknownFields
+ 
+ 	Events []*v0.Event `protobuf:"bytes,1,rep,name=events,proto3" json:"events,omitempty"`
++	// the lookup outcome for every requested event id for which no event body
++	// could be returned. Allows callers to distinguish events that are still
++	// in flight from expired ones and from transient storage failures.
++	Statuses []*EventLookupStatus `protobuf:"bytes,2,rep,name=statuses,proto3" json:"statuses,omitempty"`
+ }
+ 
+ func (x *GetEventsResponse) Reset() {
+@@ -168,71 +232,158 @@ func (x *GetEventsResponse) GetEvents() []*v0.Event {
+ 	return nil
+ }
+ 
++func (x *GetEventsResponse) GetStatuses() []*EventLookupStatus {
++	if x != nil {
++		return x.Statuses
++	}
++	return nil
++}
++
++// EventLookupStatus reports why an event body could not be returned for an id.
++type EventLookupStatus struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	// the id of the requested event
++	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
++	// the outcome of the lookup
++	State EventLookupState `protobuf:"varint,2,opt,name=state,proto3,enum=ocis.services.eventhistory.v0.EventLookupState" json:"state,omitempty"`
++}
++
++func (x *EventLookupStatus) Reset() {
++	*x = EventLookupStatus{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_ocis_services_eventhistory_v0_eventhistory_proto_msgTypes[3]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *EventLookupStatus) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*EventLookupStatus) ProtoMessage() {}
++
++func (x *EventLookupStatus) ProtoReflect() protoreflect.Message {
++	mi := &file_ocis_services_eventhistory_v0_eventhistory_proto_msgTypes[3]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use EventLookupStatus.ProtoReflect.Descriptor instead.
++func (*EventLookupStatus) Descriptor() ([]byte, []int) {
++	return file_ocis_services_eventhistory_v0_eventhistory_proto_rawDescGZIP(), []int{3}
++}
++
++func (x *EventLookupStatus) GetId() string {
++	if x != nil {
++		return x.Id
++	}
++	return ""
++}
++
++func (x *EventLookupStatus) GetState() EventLookupState {
++	if x != nil {
++		return x.State
++	}
++	return EventLookupState_EVENT_LOOKUP_STATE_UNSPECIFIED
++}
++
+ var File_ocis_services_eventhistory_v0_eventhistory_proto protoreflect.FileDescriptor
+ 
+ var file_ocis_services_eventhistory_v0_eventhistory_proto_rawDesc = []byte{
+-	0x0a, 0x30, 0x6f, 0x63, 0x69, 0x73, 0x2f, 0x73, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x73, 0x2f,
+-	0x65, 0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x2f, 0x76, 0x30, 0x2f,
+-	0x65, 0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x2e, 0x70, 0x72, 0x6f,
+-	0x74, 0x6f, 0x12, 0x1d, 0x6f, 0x63, 0x69, 0x73, 0x2e, 0x73, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65,
+-	0x73, 0x2e, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x2e, 0x76,
+-	0x30, 0x1a, 0x30, 0x6f, 0x63, 0x69, 0x73, 0x2f, 0x6d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x73,
+-	0x2f, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x2f, 0x76, 0x30,
+-	0x2f, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x2e, 0x70, 0x72,
+-	0x6f, 0x74, 0x6f, 0x1a, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x63, 0x2d, 0x67, 0x65, 0x6e, 0x2d,
+-	0x6f, 0x70, 0x65, 0x6e, 0x61, 0x70, 0x69, 0x76, 0x32, 0x2f, 0x6f, 0x70, 0x74, 0x69, 0x6f, 0x6e,
+-	0x73, 0x2f, 0x61, 0x6e, 0x6e, 0x6f, 0x74, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x73, 0x2e, 0x70, 0x72,
+-	0x6f, 0x74, 0x6f, 0x22, 0x24, 0x0a, 0x10, 0x47, 0x65, 0x74, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x73,
+-	0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x10, 0x0a, 0x03, 0x69, 0x64, 0x73, 0x18, 0x01,
+-	0x20, 0x03, 0x28, 0x09, 0x52, 0x03, 0x69, 0x64, 0x73, 0x22, 0x31, 0x0a, 0x17, 0x47, 0x65, 0x74,
+-	0x45, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x46, 0x6f, 0x72, 0x55, 0x73, 0x65, 0x72, 0x52, 0x65, 0x71,
+-	0x75, 0x65, 0x73, 0x74, 0x12, 0x16, 0x0a, 0x06, 0x75, 0x73, 0x65, 0x72, 0x49, 0x44, 0x18, 0x01,
+-	0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x75, 0x73, 0x65, 0x72, 0x49, 0x44, 0x22, 0x51, 0x0a, 0x11,
+-	0x47, 0x65, 0x74, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73,
+-	0x65, 0x12, 0x3c, 0x0a, 0x06, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x18, 0x01, 0x20, 0x03, 0x28,
+-	0x0b, 0x32, 0x24, 0x2e, 0x6f, 0x63, 0x69, 0x73, 0x2e, 0x6d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65,
+-	0x73, 0x2e, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x2e, 0x76,
+-	0x30, 0x2e, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x52, 0x06, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x32,
+-	0x83, 0x02, 0x0a, 0x13, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x48, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79,
+-	0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x12, 0x6e, 0x0a, 0x09, 0x47, 0x65, 0x74, 0x45, 0x76,
+-	0x65, 0x6e, 0x74, 0x73, 0x12, 0x2f, 0x2e, 0x6f, 0x63, 0x69, 0x73, 0x2e, 0x73, 0x65, 0x72, 0x76,
+-	0x69, 0x63, 0x65, 0x73, 0x2e, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72,
+-	0x79, 0x2e, 0x76, 0x30, 0x2e, 0x47, 0x65, 0x74, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x52, 0x65,
+-	0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x30, 0x2e, 0x6f, 0x63, 0x69, 0x73, 0x2e, 0x73, 0x65, 0x72,
+-	0x76, 0x69, 0x63, 0x65, 0x73, 0x2e, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f,
+-	0x72, 0x79, 0x2e, 0x76, 0x30, 0x2e, 0x47, 0x65, 0x74, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x52,
+-	0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x7c, 0x0a, 0x10, 0x47, 0x65, 0x74, 0x45, 0x76,
+-	0x65, 0x6e, 0x74, 0x73, 0x46, 0x6f, 0x72, 0x55, 0x73, 0x65, 0x72, 0x12, 0x36, 0x2e, 0x6f, 0x63,
+-	0x69, 0x73, 0x2e, 0x73, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x73, 0x2e, 0x65, 0x76, 0x65, 0x6e,
+-	0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x2e, 0x76, 0x30, 0x2e, 0x47, 0x65, 0x74, 0x45,
+-	0x76, 0x65, 0x6e, 0x74, 0x73, 0x46, 0x6f, 0x72, 0x55, 0x73, 0x65, 0x72, 0x52, 0x65, 0x71, 0x75,
+-	0x65, 0x73, 0x74, 0x1a, 0x30, 0x2e, 0x6f, 0x63, 0x69, 0x73, 0x2e, 0x73, 0x65, 0x72, 0x76, 0x69,
+-	0x63, 0x65, 0x73, 0x2e, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79,
+-	0x2e, 0x76, 0x30, 0x2e, 0x47, 0x65, 0x74, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x52, 0x65, 0x73,
+-	0x70, 0x6f, 0x6e, 0x73, 0x65, 0x42, 0xeb, 0x02, 0x5a, 0x43, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62,
+-	0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x6f, 0x77, 0x6e, 0x63, 0x6c, 0x6f, 0x75, 0x64, 0x2f, 0x6f, 0x63,
+-	0x69, 0x73, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x67, 0x65, 0x6e, 0x2f, 0x67, 0x65, 0x6e, 0x2f,
+-	0x6f, 0x63, 0x69, 0x73, 0x2f, 0x73, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x73, 0x2f, 0x65, 0x76,
+-	0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x2f, 0x76, 0x30, 0x92, 0x41, 0xa2,
+-	0x02, 0x12, 0xb8, 0x01, 0x0a, 0x22, 0x6f, 0x77, 0x6e, 0x43, 0x6c, 0x6f, 0x75, 0x64, 0x20, 0x49,
+-	0x6e, 0x66, 0x69, 0x6e, 0x69, 0x74, 0x65, 0x20, 0x53, 0x63, 0x61, 0x6c, 0x65, 0x20, 0x74, 0x68,
+-	0x75, 0x6d, 0x62, 0x6e, 0x61, 0x69, 0x6c, 0x73, 0x22, 0x47, 0x0a, 0x0d, 0x6f, 0x77, 0x6e, 0x43,
+-	0x6c, 0x6f, 0x75, 0x64, 0x20, 0x47, 0x6d, 0x62, 0x48, 0x12, 0x20, 0x68, 0x74, 0x74, 0x70, 0x73,
+-	0x3a, 0x2f, 0x2f, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x6f, 0x77,
+-	0x6e, 0x63, 0x6c, 0x6f, 0x75, 0x64, 0x2f, 0x6f, 0x63, 0x69, 0x73, 0x1a, 0x14, 0x73, 0x75, 0x70,
+-	0x70, 0x6f, 0x72, 0x74, 0x40, 0x6f, 0x77, 0x6e, 0x63, 0x6c, 0x6f, 0x75, 0x64, 0x2e, 0x63, 0x6f,
+-	0x6d, 0x2a, 0x42, 0x0a, 0x0a, 0x41, 0x70, 0x61, 0x63, 0x68, 0x65, 0x2d, 0x32, 0x2e, 0x30, 0x12,
+-	0x34, 0x68, 0x74, 0x74, 0x70, 0x73, 0x3a, 0x2f, 0x2f, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e,
+-	0x63, 0x6f, 0x6d, 0x2f, 0x6f, 0x77, 0x6e, 0x63, 0x6c, 0x6f, 0x75, 0x64, 0x2f, 0x6f, 0x63, 0x69,
+-	0x73, 0x2f, 0x62, 0x6c, 0x6f, 0x62, 0x2f, 0x6d, 0x61, 0x73, 0x74, 0x65, 0x72, 0x2f, 0x4c, 0x49,
+-	0x43, 0x45, 0x4e, 0x53, 0x45, 0x32, 0x05, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x2a, 0x02, 0x01, 0x02,
+-	0x32, 0x10, 0x61, 0x70, 0x70, 0x6c, 0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x2f, 0x6a, 0x73,
+-	0x6f, 0x6e, 0x3a, 0x10, 0x61, 0x70, 0x70, 0x6c, 0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x2f,
+-	0x6a, 0x73, 0x6f, 0x6e, 0x72, 0x3d, 0x0a, 0x10, 0x44, 0x65, 0x76, 0x65, 0x6c, 0x6f, 0x70, 0x65,
+-	0x72, 0x20, 0x4d, 0x61, 0x6e, 0x75, 0x61, 0x6c, 0x12, 0x29, 0x68, 0x74, 0x74, 0x70, 0x73, 0x3a,
+-	0x2f, 0x2f, 0x6f, 0x77, 0x6e, 0x63, 0x6c, 0x6f, 0x75, 0x64, 0x2e, 0x64, 0x65, 0x76, 0x2f, 0x73,
+-	0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x73, 0x2f, 0x74, 0x68, 0x75, 0x6d, 0x62, 0x6e, 0x61, 0x69,
+-	0x6c, 0x73, 0x2f, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
++	0x0a, 0x30, 0x6f, 0x63, 0x69, 0x73, 0x2f, 0x73, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x73, 0x2f, 
++	0x65, 0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x2f, 0x76, 0x30, 0x2f, 
++	0x65, 0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x2e, 0x70, 0x72, 0x6f, 
++	0x74, 0x6f, 0x12, 0x1d, 0x6f, 0x63, 0x69, 0x73, 0x2e, 0x73, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 
++	0x73, 0x2e, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x2e, 0x76, 
++	0x30, 0x1a, 0x30, 0x6f, 0x63, 0x69, 0x73, 0x2f, 0x6d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x73, 
++	0x2f, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x2f, 0x76, 0x30, 
++	0x2f, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x2e, 0x70, 0x72, 
++	0x6f, 0x74, 0x6f, 0x1a, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x63, 0x2d, 0x67, 0x65, 0x6e, 0x2d, 
++	0x6f, 0x70, 0x65, 0x6e, 0x61, 0x70, 0x69, 0x76, 0x32, 0x2f, 0x6f, 0x70, 0x74, 0x69, 0x6f, 0x6e, 
++	0x73, 0x2f, 0x61, 0x6e, 0x6e, 0x6f, 0x74, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x73, 0x2e, 0x70, 0x72, 
++	0x6f, 0x74, 0x6f, 0x22, 0x24, 0x0a, 0x10, 0x47, 0x65, 0x74, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x73, 
++	0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x10, 0x0a, 0x03, 0x69, 0x64, 0x73, 0x18, 0x01, 
++	0x20, 0x03, 0x28, 0x09, 0x52, 0x03, 0x69, 0x64, 0x73, 0x22, 0x31, 0x0a, 0x17, 0x47, 0x65, 0x74, 
++	0x45, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x46, 0x6f, 0x72, 0x55, 0x73, 0x65, 0x72, 0x52, 0x65, 0x71, 
++	0x75, 0x65, 0x73, 0x74, 0x12, 0x16, 0x0a, 0x06, 0x75, 0x73, 0x65, 0x72, 0x49, 0x44, 0x18, 0x01, 
++	0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x75, 0x73, 0x65, 0x72, 0x49, 0x44, 0x22, 0x9f, 0x01, 0x0a, 
++	0x11, 0x47, 0x65, 0x74, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 
++	0x73, 0x65, 0x12, 0x3c, 0x0a, 0x06, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x18, 0x01, 0x20, 0x03, 
++	0x28, 0x0b, 0x32, 0x24, 0x2e, 0x6f, 0x63, 0x69, 0x73, 0x2e, 0x6d, 0x65, 0x73, 0x73, 0x61, 0x67, 
++	0x65, 0x73, 0x2e, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x2e, 
++	0x76, 0x30, 0x2e, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x52, 0x06, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x73, 
++	0x12, 0x4c, 0x0a, 0x08, 0x73, 0x74, 0x61, 0x74, 0x75, 0x73, 0x65, 0x73, 0x18, 0x02, 0x20, 0x03, 
++	0x28, 0x0b, 0x32, 0x30, 0x2e, 0x6f, 0x63, 0x69, 0x73, 0x2e, 0x73, 0x65, 0x72, 0x76, 0x69, 0x63, 
++	0x65, 0x73, 0x2e, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x2e, 
++	0x76, 0x30, 0x2e, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x4c, 0x6f, 0x6f, 0x6b, 0x75, 0x70, 0x53, 0x74, 
++	0x61, 0x74, 0x75, 0x73, 0x52, 0x08, 0x73, 0x74, 0x61, 0x74, 0x75, 0x73, 0x65, 0x73, 0x22, 0x6a, 
++	0x0a, 0x11, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x4c, 0x6f, 0x6f, 0x6b, 0x75, 0x70, 0x53, 0x74, 0x61, 
++	0x74, 0x75, 0x73, 0x12, 0x0e, 0x0a, 0x02, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 
++	0x02, 0x69, 0x64, 0x12, 0x45, 0x0a, 0x05, 0x73, 0x74, 0x61, 0x74, 0x65, 0x18, 0x02, 0x20, 0x01, 
++	0x28, 0x0e, 0x32, 0x2f, 0x2e, 0x6f, 0x63, 0x69, 0x73, 0x2e, 0x73, 0x65, 0x72, 0x76, 0x69, 0x63, 
++	0x65, 0x73, 0x2e, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x2e, 
++	0x76, 0x30, 0x2e, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x4c, 0x6f, 0x6f, 0x6b, 0x75, 0x70, 0x53, 0x74, 
++	0x61, 0x74, 0x65, 0x52, 0x05, 0x73, 0x74, 0x61, 0x74, 0x65, 0x2a, 0x9c, 0x01, 0x0a, 0x10, 0x45, 
++	0x76, 0x65, 0x6e, 0x74, 0x4c, 0x6f, 0x6f, 0x6b, 0x75, 0x70, 0x53, 0x74, 0x61, 0x74, 0x65, 0x12, 
++	0x22, 0x0a, 0x1e, 0x45, 0x56, 0x45, 0x4e, 0x54, 0x5f, 0x4c, 0x4f, 0x4f, 0x4b, 0x55, 0x50, 0x5f, 
++	0x53, 0x54, 0x41, 0x54, 0x45, 0x5f, 0x55, 0x4e, 0x53, 0x50, 0x45, 0x43, 0x49, 0x46, 0x49, 0x45, 
++	0x44, 0x10, 0x00, 0x12, 0x20, 0x0a, 0x1c, 0x45, 0x56, 0x45, 0x4e, 0x54, 0x5f, 0x4c, 0x4f, 0x4f, 
++	0x4b, 0x55, 0x50, 0x5f, 0x53, 0x54, 0x41, 0x54, 0x45, 0x5f, 0x4e, 0x4f, 0x54, 0x5f, 0x46, 0x4f, 
++	0x55, 0x4e, 0x44, 0x10, 0x01, 0x12, 0x1e, 0x0a, 0x1a, 0x45, 0x56, 0x45, 0x4e, 0x54, 0x5f, 0x4c, 
++	0x4f, 0x4f, 0x4b, 0x55, 0x50, 0x5f, 0x53, 0x54, 0x41, 0x54, 0x45, 0x5f, 0x43, 0x4f, 0x52, 0x52, 
++	0x55, 0x50, 0x54, 0x10, 0x02, 0x12, 0x22, 0x0a, 0x1e, 0x45, 0x56, 0x45, 0x4e, 0x54, 0x5f, 0x4c, 
++	0x4f, 0x4f, 0x4b, 0x55, 0x50, 0x5f, 0x53, 0x54, 0x41, 0x54, 0x45, 0x5f, 0x52, 0x45, 0x41, 0x44, 
++	0x5f, 0x46, 0x41, 0x49, 0x4c, 0x45, 0x44, 0x10, 0x03, 0x32, 0x83, 0x02, 0x0a, 0x13, 0x45, 0x76, 
++	0x65, 0x6e, 0x74, 0x48, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 
++	0x65, 0x12, 0x6e, 0x0a, 0x09, 0x47, 0x65, 0x74, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x12, 0x2f, 
++	0x2e, 0x6f, 0x63, 0x69, 0x73, 0x2e, 0x73, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x73, 0x2e, 0x65, 
++	0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x2e, 0x76, 0x30, 0x2e, 0x47, 
++	0x65, 0x74, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 
++	0x30, 0x2e, 0x6f, 0x63, 0x69, 0x73, 0x2e, 0x73, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x73, 0x2e, 
++	0x65, 0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x2e, 0x76, 0x30, 0x2e, 
++	0x47, 0x65, 0x74, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 
++	0x65, 0x12, 0x7c, 0x0a, 0x10, 0x47, 0x65, 0x74, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x46, 0x6f, 
++	0x72, 0x55, 0x73, 0x65, 0x72, 0x12, 0x36, 0x2e, 0x6f, 0x63, 0x69, 0x73, 0x2e, 0x73, 0x65, 0x72, 
++	0x76, 0x69, 0x63, 0x65, 0x73, 0x2e, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 
++	0x72, 0x79, 0x2e, 0x76, 0x30, 0x2e, 0x47, 0x65, 0x74, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x46, 
++	0x6f, 0x72, 0x55, 0x73, 0x65, 0x72, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x30, 0x2e, 
++	0x6f, 0x63, 0x69, 0x73, 0x2e, 0x73, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x73, 0x2e, 0x65, 0x76, 
++	0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x2e, 0x76, 0x30, 0x2e, 0x47, 0x65, 
++	0x74, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x42, 
++	0xeb, 0x02, 0x5a, 0x43, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x6f, 
++	0x77, 0x6e, 0x63, 0x6c, 0x6f, 0x75, 0x64, 0x2f, 0x6f, 0x63, 0x69, 0x73, 0x2f, 0x70, 0x72, 0x6f, 
++	0x74, 0x6f, 0x67, 0x65, 0x6e, 0x2f, 0x67, 0x65, 0x6e, 0x2f, 0x6f, 0x63, 0x69, 0x73, 0x2f, 0x73, 
++	0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x73, 0x2f, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x68, 0x69, 0x73, 
++	0x74, 0x6f, 0x72, 0x79, 0x2f, 0x76, 0x30, 0x92, 0x41, 0xa2, 0x02, 0x12, 0xb8, 0x01, 0x0a, 0x22, 
++	0x6f, 0x77, 0x6e, 0x43, 0x6c, 0x6f, 0x75, 0x64, 0x20, 0x49, 0x6e, 0x66, 0x69, 0x6e, 0x69, 0x74, 
++	0x65, 0x20, 0x53, 0x63, 0x61, 0x6c, 0x65, 0x20, 0x74, 0x68, 0x75, 0x6d, 0x62, 0x6e, 0x61, 0x69, 
++	0x6c, 0x73, 0x22, 0x47, 0x0a, 0x0d, 0x6f, 0x77, 0x6e, 0x43, 0x6c, 0x6f, 0x75, 0x64, 0x20, 0x47, 
++	0x6d, 0x62, 0x48, 0x12, 0x20, 0x68, 0x74, 0x74, 0x70, 0x73, 0x3a, 0x2f, 0x2f, 0x67, 0x69, 0x74, 
++	0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x6f, 0x77, 0x6e, 0x63, 0x6c, 0x6f, 0x75, 0x64, 
++	0x2f, 0x6f, 0x63, 0x69, 0x73, 0x1a, 0x14, 0x73, 0x75, 0x70, 0x70, 0x6f, 0x72, 0x74, 0x40, 0x6f, 
++	0x77, 0x6e, 0x63, 0x6c, 0x6f, 0x75, 0x64, 0x2e, 0x63, 0x6f, 0x6d, 0x2a, 0x42, 0x0a, 0x0a, 0x41, 
++	0x70, 0x61, 0x63, 0x68, 0x65, 0x2d, 0x32, 0x2e, 0x30, 0x12, 0x34, 0x68, 0x74, 0x74, 0x70, 0x73, 
++	0x3a, 0x2f, 0x2f, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x6f, 0x77, 
++	0x6e, 0x63, 0x6c, 0x6f, 0x75, 0x64, 0x2f, 0x6f, 0x63, 0x69, 0x73, 0x2f, 0x62, 0x6c, 0x6f, 0x62, 
++	0x2f, 0x6d, 0x61, 0x73, 0x74, 0x65, 0x72, 0x2f, 0x4c, 0x49, 0x43, 0x45, 0x4e, 0x53, 0x45, 0x32, 
++	0x05, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x2a, 0x02, 0x01, 0x02, 0x32, 0x10, 0x61, 0x70, 0x70, 0x6c, 
++	0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x2f, 0x6a, 0x73, 0x6f, 0x6e, 0x3a, 0x10, 0x61, 0x70, 
++	0x70, 0x6c, 0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x2f, 0x6a, 0x73, 0x6f, 0x6e, 0x72, 0x3d, 
++	0x0a, 0x10, 0x44, 0x65, 0x76, 0x65, 0x6c, 0x6f, 0x70, 0x65, 0x72, 0x20, 0x4d, 0x61, 0x6e, 0x75, 
++	0x61, 0x6c, 0x12, 0x29, 0x68, 0x74, 0x74, 0x70, 0x73, 0x3a, 0x2f, 0x2f, 0x6f, 0x77, 0x6e, 0x63, 
++	0x6c, 0x6f, 0x75, 0x64, 0x2e, 0x64, 0x65, 0x76, 0x2f, 0x73, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 
++	0x73, 0x2f, 0x74, 0x68, 0x75, 0x6d, 0x62, 0x6e, 0x61, 0x69, 0x6c, 0x73, 0x2f, 0x62, 0x06, 0x70, 
++	0x72, 0x6f, 0x74, 0x6f, 0x33, 
+ }
+ 
+ var (
+@@ -247,24 +398,29 @@ func file_ocis_services_eventhistory_v0_eventhistory_proto_rawDescGZIP() []byte
+ 	return file_ocis_services_eventhistory_v0_eventhistory_proto_rawDescData
+ }
+ 
+-var file_ocis_services_eventhistory_v0_eventhistory_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
++var file_ocis_services_eventhistory_v0_eventhistory_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
++var file_ocis_services_eventhistory_v0_eventhistory_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
+ var file_ocis_services_eventhistory_v0_eventhistory_proto_goTypes = []interface{}{
+-	(*GetEventsRequest)(nil),        // 0: ocis.services.eventhistory.v0.GetEventsRequest
+-	(*GetEventsForUserRequest)(nil), // 1: ocis.services.eventhistory.v0.GetEventsForUserRequest
+-	(*GetEventsResponse)(nil),       // 2: ocis.services.eventhistory.v0.GetEventsResponse
+-	(*v0.Event)(nil),                // 3: ocis.messages.eventhistory.v0.Event
++	(EventLookupState)(0),         // 0: ocis.services.eventhistory.v0.EventLookupState
++	(*GetEventsRequest)(nil),      // 1: ocis.services.eventhistory.v0.GetEventsRequest
++	(*GetEventsForUserRequest)(nil), // 2: ocis.services.eventhistory.v0.GetEventsForUserRequest
++	(*GetEventsResponse)(nil),     // 3: ocis.services.eventhistory.v0.GetEventsResponse
++	(*EventLookupStatus)(nil),     // 4: ocis.services.eventhistory.v0.EventLookupStatus
++	(*v0.Event)(nil),              // 5: ocis.messages.eventhistory.v0.Event
+ }
+ var file_ocis_services_eventhistory_v0_eventhistory_proto_depIdxs = []int32{
+-	3, // 0: ocis.services.eventhistory.v0.GetEventsResponse.events:type_name -> ocis.messages.eventhistory.v0.Event
+-	0, // 1: ocis.services.eventhistory.v0.EventHistoryService.GetEvents:input_type -> ocis.services.eventhistory.v0.GetEventsRequest
+-	1, // 2: ocis.services.eventhistory.v0.EventHistoryService.GetEventsForUser:input_type -> ocis.services.eventhistory.v0.GetEventsForUserRequest
+-	2, // 3: ocis.services.eventhistory.v0.EventHistoryService.GetEvents:output_type -> ocis.services.eventhistory.v0.GetEventsResponse
+-	2, // 4: ocis.services.eventhistory.v0.EventHistoryService.GetEventsForUser:output_type -> ocis.services.eventhistory.v0.GetEventsResponse
+-	3, // [3:5] is the sub-list for method output_type
+-	1, // [1:3] is the sub-list for method input_type
+-	1, // [1:1] is the sub-list for extension type_name
+-	1, // [1:1] is the sub-list for extension extendee
+-	0, // [0:1] is the sub-list for field type_name
++	5, // 0: ocis.services.eventhistory.v0.GetEventsResponse.events:type_name -> ocis.messages.eventhistory.v0.Event
++	4, // 1: ocis.services.eventhistory.v0.GetEventsResponse.statuses:type_name -> ocis.services.eventhistory.v0.EventLookupStatus
++	0, // 2: ocis.services.eventhistory.v0.EventLookupStatus.state:type_name -> ocis.services.eventhistory.v0.EventLookupState
++	1, // 3: ocis.services.eventhistory.v0.EventHistoryService.GetEvents:input_type -> ocis.services.eventhistory.v0.GetEventsRequest
++	2, // 4: ocis.services.eventhistory.v0.EventHistoryService.GetEventsForUser:input_type -> ocis.services.eventhistory.v0.GetEventsForUserRequest
++	3, // 5: ocis.services.eventhistory.v0.EventHistoryService.GetEvents:output_type -> ocis.services.eventhistory.v0.GetEventsResponse
++	3, // 6: ocis.services.eventhistory.v0.EventHistoryService.GetEventsForUser:output_type -> ocis.services.eventhistory.v0.GetEventsResponse
++	5, // [5:7] is the sub-list for method output_type
++	3, // [3:5] is the sub-list for method input_type
++	3, // [3:3] is the sub-list for extension type_name
++	3, // [3:3] is the sub-list for extension extendee
++	0, // [0:3] is the sub-list for field type_name
+ }
+ 
+ func init() { file_ocis_services_eventhistory_v0_eventhistory_proto_init() }
+@@ -309,19 +465,32 @@ func file_ocis_services_eventhistory_v0_eventhistory_proto_init() {
+ 				return nil
+ 			}
+ 		}
++		file_ocis_services_eventhistory_v0_eventhistory_proto_msgTypes[3].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*EventLookupStatus); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
+ 	}
+ 	type x struct{}
+ 	out := protoimpl.TypeBuilder{
+ 		File: protoimpl.DescBuilder{
+ 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+ 			RawDescriptor: file_ocis_services_eventhistory_v0_eventhistory_proto_rawDesc,
+-			NumEnums:      0,
+-			NumMessages:   3,
++			NumEnums:      1,
++			NumMessages:   4,
+ 			NumExtensions: 0,
+ 			NumServices:   1,
+ 		},
+ 		GoTypes:           file_ocis_services_eventhistory_v0_eventhistory_proto_goTypes,
+ 		DependencyIndexes: file_ocis_services_eventhistory_v0_eventhistory_proto_depIdxs,
++		EnumInfos:         file_ocis_services_eventhistory_v0_eventhistory_proto_enumTypes,
+ 		MessageInfos:      file_ocis_services_eventhistory_v0_eventhistory_proto_msgTypes,
+ 	}.Build()
+ 	File_ocis_services_eventhistory_v0_eventhistory_proto = out.File
+diff --git a/protogen/proto/ocis/services/eventhistory/v0/eventhistory.proto b/protogen/proto/ocis/services/eventhistory/v0/eventhistory.proto
+index bd994aea..2ce7e7d3 100644
+--- a/protogen/proto/ocis/services/eventhistory/v0/eventhistory.proto
++++ b/protogen/proto/ocis/services/eventhistory/v0/eventhistory.proto
+@@ -55,4 +55,31 @@ message GetEventsForUserRequest {
+ // The service response
+ message GetEventsResponse {
+     repeated ocis.messages.eventhistory.v0.Event events = 1;
++    // the lookup outcome for every requested event id for which no event body
++    // could be returned. Allows callers to distinguish events that are still
++    // in flight from expired ones and from transient storage failures.
++    repeated EventLookupStatus statuses = 2;
++}
++
++// EventLookupStatus reports why an event body could not be returned for an id.
++message EventLookupStatus {
++    // the id of the requested event
++    string id = 1;
++    // the outcome of the lookup
++    EventLookupState state = 2;
++}
++
++// EventLookupState describes the outcome of looking up a single event body.
++enum EventLookupState {
++    // unspecified, unused
++    EVENT_LOOKUP_STATE_UNSPECIFIED = 0;
++    // no event with the requested id is currently stored; the event body may
++    // still be on its way into the store or may have expired
++    EVENT_LOOKUP_STATE_NOT_FOUND = 1;
++    // the stored event payload is corrupt and cannot be decoded, the record
++    // is considered permanently lost
++    EVENT_LOOKUP_STATE_CORRUPT = 2;
++    // reading the event failed because of a transient storage backend error,
++    // the event must be considered potentially available
++    EVENT_LOOKUP_STATE_READ_FAILED = 3;
+ }
+diff --git a/services/activitylog/pkg/config/config.go b/services/activitylog/pkg/config/config.go
+index 812beb94..1eb3ccf7 100644
+--- a/services/activitylog/pkg/config/config.go
++++ b/services/activitylog/pkg/config/config.go
+@@ -30,6 +30,11 @@ type Config struct {
+ 	TranslationPath string `yaml:"translation_path" env:"OCIS_TRANSLATION_PATH;ACTIVITYLOG_TRANSLATION_PATH" desc:"(optional) Set this to a path with custom translations to overwrite the builtin translations. Note that file and folder naming rules apply, see the documentation for more details." introductionVersion:"7.0.0"`
+ 	DefaultLanguage string `yaml:"default_language" env:"OCIS_DEFAULT_LANGUAGE" desc:"The default language used by services and the WebUI. If not defined, English will be used as default. See the documentation for more details." introductionVersion:"7.0.0"`
+ 
++	// EventHistoryTTL must match the eventhistory store TTL. It is used to
++	// distinguish event bodies that are still on their way into the store from
++	// ones that have definitely expired.
++	EventHistoryTTL time.Duration `yaml:"event_history_ttl" env:"OCIS_PERSISTENT_STORE_TTL;ACTIVITYLOG_EVENT_HISTORY_TTL" desc:"The time event bodies are retained in the eventhistory store. Must match the eventhistory store TTL. References older than this duration are considered expired when the event body is missing. See the Environment Variable Types description for more details." introductionVersion:"pre5.0"`
++
+ 	ServiceAccount ServiceAccount `yaml:"service_account" mask:"struct"`
+ 
+ 	Context context.Context `yaml:"-"`
+diff --git a/services/activitylog/pkg/config/defaults/defaultconfig.go b/services/activitylog/pkg/config/defaults/defaultconfig.go
+index a9ff65e4..01a17403 100644
+--- a/services/activitylog/pkg/config/defaults/defaultconfig.go
++++ b/services/activitylog/pkg/config/defaults/defaultconfig.go
+@@ -1,6 +1,8 @@
+ package defaults
+ 
+ import (
++	"time"
++
+ 	"github.com/owncloud/ocis/v2/ocis-pkg/shared"
+ 	"github.com/owncloud/ocis/v2/ocis-pkg/structs"
+ 	"github.com/owncloud/ocis/v2/services/activitylog/pkg/config"
+@@ -39,6 +41,8 @@ func DefaultConfig() *config.Config {
+ 		},
+ 		RevaGateway:     shared.DefaultRevaConfig().Address,
+ 		DefaultLanguage: "en",
++		// must match the eventhistory service default store TTL
++		EventHistoryTTL: 336 * time.Hour,
+ 		HTTP: config.HTTP{
+ 			Addr:      "127.0.0.1:9195",
+ 			Root:      "/",
+diff --git a/services/activitylog/pkg/service/convergence_test.go b/services/activitylog/pkg/service/convergence_test.go
+new file mode 100644
+index 00000000..a17ac4b2
+--- /dev/null
++++ b/services/activitylog/pkg/service/convergence_test.go
+@@ -0,0 +1,423 @@
++﻿package service
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"reflect"
++	"sync"
++	"testing"
++	"time"
++
++	provider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
++	"github.com/owncloud/reva/v2/pkg/events"
++	"github.com/owncloud/reva/v2/pkg/storagespace"
++	"github.com/owncloud/reva/v2/pkg/store"
++	"github.com/stretchr/testify/require"
++	"go-micro.dev/v4/client"
++	microstore "go-micro.dev/v4/store"
++
++	"github.com/owncloud/ocis/v2/ocis-pkg/log"
++	ehmsg "github.com/owncloud/ocis/v2/protogen/gen/ocis/messages/eventhistory/v0"
++	ehsvc "github.com/owncloud/ocis/v2/protogen/gen/ocis/services/eventhistory/v0"
++)
++
++var errHistoryUnavailable = errors.New("eventhistory unavailable")
++
++// fakeHistoryClient is a test double for the eventhistory gRPC client.
++type fakeHistoryClient struct {
++	mu        sync.Mutex
++	requests  [][]string
++	responder func(ids []string) (*ehsvc.GetEventsResponse, error)
++}
++
++func (f *fakeHistoryClient) GetEvents(_ context.Context, in *ehsvc.GetEventsRequest, _ ...client.CallOption) (*ehsvc.GetEventsResponse, error) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	ids := append([]string(nil), in.GetIds()...)
++	f.requests = append(f.requests, ids)
++	if f.responder == nil {
++		return &ehsvc.GetEventsResponse{}, nil
++	}
++	return f.responder(ids)
++}
++
++func (f *fakeHistoryClient) GetEventsForUser(_ context.Context, _ *ehsvc.GetEventsForUserRequest, _ ...client.CallOption) (*ehsvc.GetEventsResponse, error) {
++	return &ehsvc.GetEventsResponse{}, nil
++}
++
++func (f *fakeHistoryClient) callCount() int {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return len(f.requests)
++}
++
++func newConvergenceService(t *testing.T, ttl time.Duration, hc ehsvc.EventHistoryService, registerEvents bool) *ActivitylogService {
++	t.Helper()
++	registered := map[string]events.Unmarshaller{}
++	if registerEvents {
++		for _, e := range []events.Unmarshaller{events.UploadReady{}} {
++			registered[reflect.TypeOf(e).String()] = e
++		}
++	}
++	return &ActivitylogService{
++		log:              log.Logger{},
++		store:            store.Create(),
++		evHistory:        hc,
++		eventHistoryTTL:  ttl,
++		registeredEvents: registered,
++	}
++}
++
++func seedReferences(t *testing.T, a *ActivitylogService, rid *provider.ResourceId, refs []RawActivity) {
++	t.Helper()
++	b, err := json.Marshal(refs)
++	require.NoError(t, err)
++	require.NoError(t, a.store.Write(&microstore.Record{
++		Key:   storagespace.FormatResourceID(rid),
++		Value: b,
++	}))
++}
++
++func readReferences(t *testing.T, a *ActivitylogService, rid *provider.ResourceId) []RawActivity {
++	t.Helper()
++	refs, err := a.Activities(rid)
++	require.NoError(t, err)
++	return refs
++}
++
++func notFoundStatus(ids ...string) *ehsvc.GetEventsResponse {
++	resp := &ehsvc.GetEventsResponse{}
++	for _, id := range ids {
++		resp.Statuses = append(resp.Statuses, &ehsvc.EventLookupStatus{
++			Id:    id,
++			State: ehsvc.EventLookupState_EVENT_LOOKUP_STATE_NOT_FOUND,
++		})
++	}
++	return resp
++}
++
++func statusResponse(state ehsvc.EventLookupState, ids ...string) *ehsvc.GetEventsResponse {
++	resp := &ehsvc.GetEventsResponse{}
++	for _, id := range ids {
++		resp.Statuses = append(resp.Statuses, &ehsvc.EventLookupStatus{Id: id, State: state})
++	}
++	return resp
++}
++
++func decodableEventMsg(id string) *ehmsg.Event {
++	b, err := json.Marshal(events.UploadReady{})
++	if err != nil {
++		panic(err)
++	}
++	return &ehmsg.Event{
++		Id:    id,
++		Type:  reflect.TypeOf(events.UploadReady{}).String(),
++		Event: b,
++	}
++}
++
++func TestDecideConvergence(t *testing.T) {
++	ttl := 2 * time.Hour
++	now := time.Now()
++	young := now.Add(-30 * time.Minute)
++	old := now.Add(-3 * time.Hour)
++
++	a := newConvergenceService(t, ttl, &fakeHistoryClient{}, true)
++
++	for _, tc := range []struct {
++		name   string
++		ts     time.Time
++		lookup eventBodyLookup
++		want   convergenceDecision
++	}{
++		{"present body always keeps", young, lookupPresent, convergeKeep},
++		{"present old body keeps", old, lookupPresent, convergeKeep},
++		{"unknown status keeps", old, lookupUnknown, convergeKeep},
++		{"transient read failure keeps even old", old, lookupReadFailed, convergeKeep},
++		{"missing within retention is in flight", young, lookupNotFound, convergeKeep},
++		{"missing beyond retention is expired", old, lookupNotFound, convergeDrop},
++		{"corrupt young body drops", young, lookupCorrupt, convergeDrop},
++		{"corrupt old body drops", old, lookupCorrupt, convergeDrop},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			require.Equal(t, tc.want, a.decideConvergence(RawActivity{Timestamp: tc.ts}, tc.lookup, now))
++		})
++	}
++
++	// at exactly TTL + grace the reference is considered expired
++	boundary := RawActivity{Timestamp: now.Add(-(ttl + eventArrivalGrace))}
++	require.Equal(t, convergeDrop, a.decideConvergence(boundary, lookupNotFound, now))
++}
++
++func TestEventBodyLookupFromStatus(t *testing.T) {
++	require.Equal(t, lookupNotFound, eventBodyLookupFromStatus(ehsvc.EventLookupState_EVENT_LOOKUP_STATE_NOT_FOUND))
++	require.Equal(t, lookupCorrupt, eventBodyLookupFromStatus(ehsvc.EventLookupState_EVENT_LOOKUP_STATE_CORRUPT))
++	require.Equal(t, lookupReadFailed, eventBodyLookupFromStatus(ehsvc.EventLookupState_EVENT_LOOKUP_STATE_READ_FAILED))
++	require.Equal(t, lookupUnknown, eventBodyLookupFromStatus(ehsvc.EventLookupState_EVENT_LOOKUP_STATE_UNSPECIFIED))
++}
++
++func TestConvergeReferencesExpiredVsInFlight(t *testing.T) {
++	rid := resourceID("base")
++	now := time.Now()
++	expired1 := RawActivity{EventID: "expired-1", Timestamp: now.Round(0).Add(-3 * time.Hour)}
++	expired2 := RawActivity{EventID: "expired-2", Timestamp: now.Round(0).Add(-4 * time.Hour)}
++	inflight := RawActivity{EventID: "in-flight", Timestamp: now.Round(0).Add(-1 * time.Minute)}
++	unrelated := RawActivity{EventID: "unrelated", Timestamp: now.Round(0).Add(-5 * time.Hour)}
++
++	hc := &fakeHistoryClient{
++		responder: func(ids []string) (*ehsvc.GetEventsResponse, error) {
++			// converge re-arbitrates every candidate, even ones the read
++			// already classified as dead
++			return notFoundStatus(ids...), nil
++		},
++	}
++	a := newConvergenceService(t, time.Hour, hc, true)
++	seedReferences(t, a, rid, []RawActivity{expired1, expired2, inflight, unrelated})
++
++	// the read would only submit expired references as dead; submitting the
++	// in-flight one as well proves converge does not trust stale decisions
++	a.convergeReferences(rid, map[string]time.Time{
++		expired1.EventID: expired1.Timestamp,
++		expired2.EventID: expired2.Timestamp,
++		inflight.EventID: inflight.Timestamp,
++	})
++
++	got := readReferences(t, a, rid)
++	var ids []string
++	for _, ra := range got {
++		ids = append(ids, ra.EventID)
++	}
++	require.ElementsMatch(t, []string{"in-flight", "unrelated"}, ids)
++}
++
++func TestConvergeReferencesTransientReadFailureKeeps(t *testing.T) {
++	rid := resourceID("base")
++	old := RawActivity{EventID: "old", Timestamp: time.Now().Round(0).Add(-5 * time.Hour)}
++
++	hc := &fakeHistoryClient{
++		responder: func(ids []string) (*ehsvc.GetEventsResponse, error) {
++			return statusResponse(ehsvc.EventLookupState_EVENT_LOOKUP_STATE_READ_FAILED, ids...), nil
++		},
++	}
++	a := newConvergenceService(t, time.Hour, hc, true)
++	seedReferences(t, a, rid, []RawActivity{old})
++
++	a.convergeReferences(rid, map[string]time.Time{old.EventID: old.Timestamp})
++
++	require.ElementsMatch(t, []RawActivity{old}, readReferences(t, a, rid))
++}
++
++func TestConvergeReferencesCorruptDrops(t *testing.T) {
++	rid := resourceID("base")
++	young := RawActivity{EventID: "young-corrupt", Timestamp: time.Now().Round(0).Add(-1 * time.Minute)}
++
++	hc := &fakeHistoryClient{
++		responder: func(ids []string) (*ehsvc.GetEventsResponse, error) {
++			return statusResponse(ehsvc.EventLookupState_EVENT_LOOKUP_STATE_CORRUPT, ids...), nil
++		},
++	}
++	a := newConvergenceService(t, time.Hour, hc, true)
++	seedReferences(t, a, rid, []RawActivity{young})
++
++	a.convergeReferences(rid, map[string]time.Time{young.EventID: young.Timestamp})
++
++	require.Empty(t, readReferences(t, a, rid))
++}
++
++func TestConvergeReferencesEventHistoryUnavailableKeeps(t *testing.T) {
++	rid := resourceID("base")
++	old := RawActivity{EventID: "old", Timestamp: time.Now().Round(0).Add(-5 * time.Hour)}
++
++	hc := &fakeHistoryClient{
++		responder: func(_ []string) (*ehsvc.GetEventsResponse, error) {
++			return nil, errHistoryUnavailable
++		},
++	}
++	a := newConvergenceService(t, time.Hour, hc, true)
++	seedReferences(t, a, rid, []RawActivity{old})
++
++	a.convergeReferences(rid, map[string]time.Time{old.EventID: old.Timestamp})
++
++	require.ElementsMatch(t, []RawActivity{old}, readReferences(t, a, rid))
++}
++
++func TestConvergeReferencesGenerationMismatchKeeps(t *testing.T) {
++	rid := resourceID("base")
++	current := RawActivity{EventID: "e", Timestamp: time.Now().Round(0).Add(-5 * time.Hour)}
++
++	hc := &fakeHistoryClient{
++		responder: func(ids []string) (*ehsvc.GetEventsResponse, error) {
++			return notFoundStatus(ids...), nil
++		},
++	}
++	a := newConvergenceService(t, time.Hour, hc, true)
++	seedReferences(t, a, rid, []RawActivity{current})
++
++	// a stale read recorded a different generation of the same reference
++	a.convergeReferences(rid, map[string]time.Time{"e": current.Timestamp.Add(-time.Hour)})
++
++	require.ElementsMatch(t, []RawActivity{current}, readReferences(t, a, rid))
++	require.Equal(t, 0, hc.callCount(), "no re-check must happen for generation mismatches")
++}
++
++func TestConvergeReferencesBodyArrivedKeeps(t *testing.T) {
++	rid := resourceID("base")
++	old := RawActivity{EventID: "late-body", Timestamp: time.Now().Round(0).Add(-5 * time.Hour)}
++
++	// the body arrives right after the read classified the reference as dead
++	hc := &fakeHistoryClient{
++		responder: func(ids []string) (*ehsvc.GetEventsResponse, error) {
++			return &ehsvc.GetEventsResponse{Events: []*ehmsg.Event{decodableEventMsg(ids[0])}}, nil
++		},
++	}
++	a := newConvergenceService(t, time.Hour, hc, true)
++	seedReferences(t, a, rid, []RawActivity{old})
++
++	a.convergeReferences(rid, map[string]time.Time{old.EventID: old.Timestamp})
++
++	require.ElementsMatch(t, []RawActivity{old}, readReferences(t, a, rid))
++}
++
++func TestConvergeReferencesStillUndecodableDrops(t *testing.T) {
++	rid := resourceID("base")
++	old := RawActivity{EventID: "undecodable", Timestamp: time.Now().Round(0).Add(-5 * time.Hour)}
++
++	hc := &fakeHistoryClient{
++		responder: func(ids []string) (*ehsvc.GetEventsResponse, error) {
++			// eventhistory has a body, but the activitylog can not decode it
++			b, _ := json.Marshal(struct{ UnknownField int }{UnknownField: 1})
++			return &ehsvc.GetEventsResponse{Events: []*ehmsg.Event{{
++				Id:    ids[0],
++				Type:  "some.unregistered.Type",
++				Event: b,
++			}}}, nil
++		},
++	}
++	a := newConvergenceService(t, time.Hour, hc, true)
++	seedReferences(t, a, rid, []RawActivity{old})
++
++	a.convergeReferences(rid, map[string]time.Time{old.EventID: old.Timestamp})
++
++	require.Empty(t, readReferences(t, a, rid))
++}
++
++func TestConvergeReferencesEmptyAndMissingDoNotCall(t *testing.T) {
++	rid := resourceID("base")
++	hc := &fakeHistoryClient{}
++	a := newConvergenceService(t, time.Hour, hc, true)
++
++	a.convergeReferences(rid, nil)
++	a.convergeReferences(rid, map[string]time.Time{"gone": time.Now()})
++
++	require.Equal(t, 0, hc.callCount())
++}
++
++func TestConvergeReferencesIsConcurrencySafe(t *testing.T) {
++	rid := resourceID("base")
++	ts := time.Now().Round(0).Add(-5 * time.Hour)
++	refs := []RawActivity{
++		{EventID: "e1", Timestamp: ts},
++		{EventID: "e2", Timestamp: ts},
++		{EventID: "keep", Timestamp: time.Now().Round(0)},
++	}
++
++	hc := &fakeHistoryClient{
++		responder: func(ids []string) (*ehsvc.GetEventsResponse, error) {
++			return notFoundStatus(ids...), nil
++		},
++	}
++	a := newConvergenceService(t, time.Hour, hc, true)
++	seedReferences(t, a, rid, refs)
++
++	var wg sync.WaitGroup
++	for i := 0; i < 20; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			a.convergeReferences(rid, map[string]time.Time{"e1": ts, "e2": ts})
++		}()
++	}
++	wg.Wait()
++
++	// the remaining list must be intact and readable (no torn writes)
++	require.ElementsMatch(t, []RawActivity{{EventID: "keep", Timestamp: refs[2].Timestamp}}, readReferences(t, a, rid))
++}
++
++// TestConvergeReferencesPersistentState simulates both services restarting:
++// conclusions derive solely from the persisted reference timestamp and the
++// configured TTL, so freshly constructed services sharing the store reach the
++// same decision.
++func TestConvergeReferencesPersistentState(t *testing.T) {
++	rid := resourceID("base")
++	young := RawActivity{EventID: "young", Timestamp: time.Now().Round(0).Add(-1 * time.Minute)}
++	old := RawActivity{EventID: "old", Timestamp: time.Now().Round(0).Add(-5 * time.Hour)}
++	sto := store.Create()
++	seedReferences(t, &ActivitylogService{store: sto}, rid, []RawActivity{young, old})
++
++	notFoundHC := func() *fakeHistoryClient {
++		return &fakeHistoryClient{responder: func(ids []string) (*ehsvc.GetEventsResponse, error) {
++			return notFoundStatus(ids...), nil
++		}}
++	}
++
++	// "restarted" service instance, young reference is kept
++	a1 := &ActivitylogService{log: log.Logger{}, store: sto, evHistory: notFoundHC(), eventHistoryTTL: time.Hour, registeredEvents: map[string]events.Unmarshaller{}}
++	a1.convergeReferences(rid, map[string]time.Time{"young": young.Timestamp})
++
++	// another "restart", same store and TTL, old reference is removed
++	a2 := &ActivitylogService{log: log.Logger{}, store: sto, evHistory: notFoundHC(), eventHistoryTTL: time.Hour, registeredEvents: map[string]events.Unmarshaller{}}
++	a2.convergeReferences(rid, map[string]time.Time{"old": old.Timestamp})
++
++	got := readReferences(t, &ActivitylogService{store: sto}, rid)
++	var ids []string
++	for _, ra := range got {
++		ids = append(ids, ra.EventID)
++	}
++	require.ElementsMatch(t, []string{"young"}, ids)
++}
++
++// TestMissingBodyArrivesLaterFillsIn covers the core scenario: a reference
++// exists before its eventhistory body; reads within the retention window keep
++// it, and once the body arrives the activity can be composed on a later read.
++func TestMissingBodyArrivesLaterFillsIn(t *testing.T) {
++	rid := resourceID("base")
++	ra := RawActivity{EventID: "late", Timestamp: time.Now().Round(0)}
++	sto := store.Create()
++	seedReferences(t, &ActivitylogService{store: sto}, rid, []RawActivity{ra})
++
++	hc := &fakeHistoryClient{}
++	var calls int
++	hc.responder = func(ids []string) (*ehsvc.GetEventsResponse, error) {
++		calls++
++		// first "read": body still in flight
++		if calls == 1 {
++			return notFoundStatus(ids...), nil
++		}
++		// later "read": body has been written
++		return &ehsvc.GetEventsResponse{Events: []*ehmsg.Event{decodableEventMsg(ids[0])}}, nil
++	}
++	a := newConvergenceService(t, time.Hour, hc, true)
++	a.store = sto
++
++	// first read: not found but within retention, so nothing is dead
++	res, err := hc.GetEvents(context.Background(), &ehsvc.GetEventsRequest{Ids: []string{ra.EventID}})
++	require.NoError(t, err)
++	states := map[string]ehsvc.EventLookupState{}
++	for _, st := range res.GetStatuses() {
++		states[st.GetId()] = st.GetState()
++	}
++	require.Len(t, res.GetEvents(), 0)
++	require.Equal(t, convergeKeep, a.decideConvergence(ra, eventBodyLookupFromStatus(states[ra.EventID]), time.Now()))
++
++	// reference is still there after the first read
++	require.ElementsMatch(t, []RawActivity{ra}, readReferences(t, a, rid))
++
++	// second read: the body arrives and is returned
++	res2, err := hc.GetEvents(context.Background(), &ehsvc.GetEventsRequest{Ids: []string{ra.EventID}})
++	require.NoError(t, err)
++	require.Len(t, res2.GetEvents(), 1)
++	require.Equal(t, ra.EventID, res2.GetEvents()[0].GetId())
++	// and the reference was never deleted
++	require.ElementsMatch(t, []RawActivity{ra}, readReferences(t, a, rid))
++}
+diff --git a/services/activitylog/pkg/service/http.go b/services/activitylog/pkg/service/http.go
+index 629a057f..31ba3ea8 100644
+--- a/services/activitylog/pkg/service/http.go
++++ b/services/activitylog/pkg/service/http.go
+@@ -86,29 +86,48 @@ func (s *ActivitylogService) HandleGetItemActivities(w http.ResponseWriter, r *h
+ 		return
+ 	}
+ 
++	// snapshot the references together with their generation (timestamp).
++	// The generation is verified again before a reference is removed.
++	refs := make(map[string]RawActivity, len(raw))
+ 	ids := make([]string, 0, len(raw))
+-	toDelete := make(map[string]struct{}, len(raw))
+ 	for _, a := range raw {
+ 		if !rawActivityAccepted(a) {
+ 			continue
+ 		}
++		if _, ok := refs[a.EventID]; ok {
++			continue
++		}
++		refs[a.EventID] = a
+ 		ids = append(ids, a.EventID)
+-		toDelete[a.EventID] = struct{}{}
+ 	}
+ 
+ 	evRes, err := s.evHistory.GetEvents(r.Context(), &ehsvc.GetEventsRequest{Ids: ids})
+ 	if err != nil {
++		// eventhistory is unavailable: we can not tell existing bodies from
++		// missing ones, so do not perform any destructive cleanup
+ 		s.log.Error().Err(err).Msg("error getting events")
+ 		w.WriteHeader(http.StatusInternalServerError)
+ 		return
+ 	}
+ 
++	lookupStatus := make(map[string]ehsvc.EventLookupState, len(evRes.GetStatuses()))
++	for _, st := range evRes.GetStatuses() {
++		lookupStatus[st.GetId()] = st.GetState()
++	}
++	found := make(map[string]struct{}, len(evRes.GetEvents()))
++
+ 	evs := evRes.GetEvents()
+ 	sort(evs)
+ 
+ 	resp := GetActivitiesResponse{Activities: make([]libregraph.Activity, 0, len(evRes.GetEvents()))}
++	// dead collects references that are confirmed dead based on this read.
++	// The value is the observed generation of the reference.
++	dead := make(map[string]time.Time)
++	now := time.Now()
+ 	for _, e := range evs {
+-		delete(toDelete, e.GetId())
++		// a body exists, the reference itself is valid regardless of whether
++		// the activity is rendered below (limit, filters)
++		found[e.GetId()] = struct{}{}
+ 
+ 		if limit > 0 && limit <= len(resp.Activities) {
+ 			continue
+@@ -129,6 +148,13 @@ func (s *ActivitylogService) HandleGetItemActivities(w http.ResponseWriter, r *h
+ 
+ 		switch ev := s.unwrapEvent(e).(type) {
+ 		case nil:
++			// the body exists but can never be turned into an activity
++			// (unknown type or undecodable payload): the reference is
++			// permanently unusable. Drop it instead of erroring on it on
++			// every future read.
++			if ra, ok := refs[e.GetId()]; ok {
++				dead[e.GetId()] = ra.Timestamp
++			}
+ 			// error already logged in unwrapEvent
+ 			continue
+ 		case events.UploadReady:
+@@ -233,14 +259,18 @@ func (s *ActivitylogService) HandleGetItemActivities(w http.ResponseWriter, r *h
+ 		resp.Activities = append(resp.Activities, NewActivity(t.Translate(message, loc), ts, e.GetId(), vars))
+ 	}
+ 
+-	// delete activities in separate go routine
+-	if len(toDelete) > 0 {
+-		go func() {
+-			err := s.RemoveActivities(rid, toDelete)
+-			if err != nil {
+-				s.log.Error().Err(err).Msg("error removing activities")
+-			}
+-		}()
++	// references without a body: converge only when the body is confirmed
++	// dead. A missing body within the retention window means the event is
++	// still in flight - the reference is kept and filled in by a later read.
++	// Transient storage failures and missing status information keep the
++	// reference as well.
++	for id, ra := range refs {
++		if _, ok := found[id]; ok {
++			continue
++		}
++		if s.decideConvergence(ra, eventBodyLookupFromStatus(lookupStatus[id]), now) == convergeDrop {
++			dead[id] = ra.Timestamp
++		}
+ 	}
+ 
+ 	b, err := json.Marshal(resp)
+@@ -251,11 +281,21 @@ func (s *ActivitylogService) HandleGetItemActivities(w http.ResponseWriter, r *h
+ 	}
+ 
+ 	if _, err := w.Write(b); err != nil {
++		// writing the response failed: the client may not have received the
++		// current state, so do not perform destructive cleanup based on it
+ 		s.log.Error().Err(err).Msg("error writing response")
+ 		w.WriteHeader(http.StatusInternalServerError)
+ 		return
+ 	}
+ 	w.WriteHeader(http.StatusOK)
++
++	// converge dead references in a separate goroutine, and only after the
++	// response was successfully sent
++	if len(dead) > 0 {
++		go func() {
++			s.convergeReferences(rid, dead)
++		}()
++	}
+ }
+ 
+ func (s *ActivitylogService) unwrapEvent(e *ehmsg.Event) interface{} {
+diff --git a/services/activitylog/pkg/service/service.go b/services/activitylog/pkg/service/service.go
+index 166a19ec..7672030b 100644
+--- a/services/activitylog/pkg/service/service.go
++++ b/services/activitylog/pkg/service/service.go
+@@ -22,6 +22,7 @@ import (
+ 
+ 	"github.com/owncloud/ocis/v2/ocis-pkg/log"
+ 	"github.com/owncloud/ocis/v2/ocis-pkg/tracing"
++	ehmsg "github.com/owncloud/ocis/v2/protogen/gen/ocis/messages/eventhistory/v0"
+ 	ehsvc "github.com/owncloud/ocis/v2/protogen/gen/ocis/services/eventhistory/v0"
+ 	settingssvc "github.com/owncloud/ocis/v2/protogen/gen/ocis/services/settings/v0"
+ 	"github.com/owncloud/ocis/v2/services/activitylog/pkg/config"
+@@ -30,6 +31,20 @@ import (
+ // Nats runs into max payload exceeded errors at around 7k activities. Let's keep a buffer.
+ var _maxActivities = 6000
+ 
++// defaultEventHistoryTTL matches the default TTL of the eventhistory store.
++// It is only used when no explicit TTL is configured.
++const defaultEventHistoryTTL = 336 * time.Hour
++
++// eventArrivalGrace is added to the eventhistory TTL when deciding whether a
++// missing event body might still be in flight. It covers clock skew between
++// the activitylog and eventhistory services as well as event delivery and
++// processing delays.
++const eventArrivalGrace = time.Minute
++
++// convergenceTimeout bounds the eventhistory re-check performed while
++// converging references.
++const convergenceTimeout = 10 * time.Second
++
+ // RawActivity represents an activity as it is stored in the activitylog store
+ type RawActivity struct {
+ 	EventID   string    `json:"event_id"`
+@@ -37,6 +52,38 @@ type RawActivity struct {
+ 	Timestamp time.Time `json:"timestamp"`
+ }
+ 
++// eventBodyLookup is the activitylog view of the eventhistory lookup outcome
++// for a single referenced event.
++type eventBodyLookup int
++
++const (
++	// lookupUnknown means eventhistory did not report on the id, e.g. an
++	// older eventhistory version. The reference is treated as potentially
++	// valid and is never removed.
++	lookupUnknown eventBodyLookup = iota
++	// lookupPresent means the event body was returned.
++	lookupPresent
++	// lookupNotFound means no body is stored at the moment; it may still be
++	// in flight or may have expired.
++	lookupNotFound
++	// lookupCorrupt means a body is stored but can not be decoded and is
++	// therefore permanently lost.
++	lookupCorrupt
++	// lookupReadFailed means a transient storage backend error prevented the
++	// body from being read. The event must be considered potentially valid.
++	lookupReadFailed
++)
++
++// convergenceDecision states what should happen with an activity reference.
++type convergenceDecision int
++
++const (
++	// convergeKeep retains the reference for future reads.
++	convergeKeep convergenceDecision = iota
++	// convergeDrop removes the reference: it is confirmed dead.
++	convergeDrop
++)
++
+ // ActivitylogService logs events per resource
+ type ActivitylogService struct {
+ 	cfg        *config.Config
+@@ -49,6 +96,11 @@ type ActivitylogService struct {
+ 	valService settingssvc.ValueService
+ 	lock       sync.RWMutex
+ 
++	// eventHistoryTTL is the retention duration of the eventhistory store.
++	// A reference whose event body is missing and whose timestamp is older
++	// than TTL + grace is considered expired.
++	eventHistoryTTL time.Duration
++
+ 	registeredEvents map[string]events.Unmarshaller
+ }
+ 
+@@ -72,6 +124,11 @@ func New(opts ...Option) (*ActivitylogService, error) {
+ 		return nil, err
+ 	}
+ 
++	ttl := defaultEventHistoryTTL
++	if o.Config != nil && o.Config.EventHistoryTTL > 0 {
++		ttl = o.Config.EventHistoryTTL
++	}
++
+ 	s := &ActivitylogService{
+ 		log:              o.Logger,
+ 		cfg:              o.Config,
+@@ -82,6 +139,7 @@ func New(opts ...Option) (*ActivitylogService, error) {
+ 		evHistory:        o.HistoryClient,
+ 		valService:       o.ValueClient,
+ 		lock:             sync.RWMutex{},
++		eventHistoryTTL:  ttl,
+ 		registeredEvents: make(map[string]events.Unmarshaller),
+ 	}
+ 
+@@ -225,32 +283,159 @@ func (a *ActivitylogService) Activities(rid *provider.ResourceId) ([]RawActivity
+ 	return a.activities(rid)
+ }
+ 
+-// RemoveActivities removes the activities from the given resource
+-func (a *ActivitylogService) RemoveActivities(rid *provider.ResourceId, toDelete map[string]struct{}) error {
++// convergeReferences removes references that a read classified as dead, but
++// only if both conditions still hold at deletion time:
++//
++//   - the same generation of the reference is still stored. The reference
++//     timestamp acts as its generation: if it changed or disappeared in the
++//     meantime, another state owns the reference and this stale read must not
++//     touch it.
++//   - eventhistory still confirms the event body as dead. A body arriving
++//     right after the read's cleanup decision makes the reference valid
++//     again, so it must be kept.
++//
++// No destructive write happens when the activitylog store cannot be read,
++// when eventhistory is unavailable or when individual bodies can only be
++// read with transient errors.
++func (a *ActivitylogService) convergeReferences(rid *provider.ResourceId, dead map[string]time.Time) {
++	if len(dead) == 0 {
++		return
++	}
++
+ 	a.lock.Lock()
+ 	defer a.lock.Unlock()
+ 
+-	curActivities, err := a.activities(rid)
++	cur, err := a.activities(rid)
+ 	if err != nil {
+-		return err
++		a.log.Error().Err(err).Msg("could not read activities while converging references")
++		return
+ 	}
+ 
+-	var acts []RawActivity
+-	for _, a := range curActivities {
+-		if _, ok := toDelete[a.EventID]; !ok {
+-			acts = append(acts, a)
++	// restrict the re-check to references that still exist with the exact
++	// same generation as during the read
++	candidates := make(map[string]RawActivity, len(dead))
++	ids := make([]string, 0, len(dead))
++	for _, ra := range cur {
++		gen, ok := dead[ra.EventID]
++		if !ok || !ra.Timestamp.Equal(gen) {
++			continue
++		}
++		if _, queued := candidates[ra.EventID]; !queued {
++			candidates[ra.EventID] = ra
++			ids = append(ids, ra.EventID)
+ 		}
+ 	}
++	if len(ids) == 0 {
++		return
++	}
++
++	// final arbitration against eventhistory: the body may have arrived
++	// after the read classified the reference as dead
++	ctx, cancel := context.WithTimeout(context.Background(), convergenceTimeout)
++	defer cancel()
++	res, err := a.evHistory.GetEvents(ctx, &ehsvc.GetEventsRequest{Ids: ids})
++	if err != nil {
++		a.log.Error().Err(err).Msg("could not re-check events while converging references")
++		return
++	}
++
++	found := make(map[string]*ehmsg.Event, len(res.GetEvents()))
++	for _, e := range res.GetEvents() {
++		found[e.GetId()] = e
++	}
++	states := make(map[string]ehsvc.EventLookupState, len(res.GetStatuses()))
++	for _, st := range res.GetStatuses() {
++		states[st.GetId()] = st.GetState()
++	}
++
++	now := time.Now()
++	toDelete := make(map[string]struct{}, len(ids))
++	for _, id := range ids {
++		if e, ok := found[id]; ok {
++			// the body exists. It is only safe to drop if it is still
++			// undecodable for this service; a body that can now be turned
++			// into an activity (e.g. after an upgrade) keeps its reference.
++			if a.unwrapEvent(e) == nil {
++				toDelete[id] = struct{}{}
++			}
++			continue
++		}
++		if a.decideConvergence(candidates[id], eventBodyLookupFromStatus(states[id]), now) == convergeDrop {
++			toDelete[id] = struct{}{}
++		}
++	}
++	if len(toDelete) == 0 {
++		return
++	}
++
++	acts := make([]RawActivity, 0, len(cur))
++	for _, ra := range cur {
++		if _, drop := toDelete[ra.EventID]; drop {
++			continue
++		}
++		acts = append(acts, ra)
++	}
+ 
+ 	b, err := json.Marshal(acts)
+ 	if err != nil {
+-		return err
++		a.log.Error().Err(err).Msg("could not marshal activities while converging references")
++		return
+ 	}
+ 
+-	return a.store.Write(&microstore.Record{
++	if err := a.store.Write(&microstore.Record{
+ 		Key:   storagespace.FormatResourceID(rid),
+ 		Value: b,
+-	})
++	}); err != nil {
++		a.log.Error().Err(err).Msg("could not store activities while converging references")
++	}
++}
++
++// decideConvergence determines whether an activity reference is safe to drop.
++// Only bodies confirmed permanently lost (corrupt) or missing beyond the
++// eventhistory retention period lead to convergeDrop. Everything else, in
++// particular transient read failures, keeps the reference so a later read can
++// fill in the activity once the body becomes visible.
++func (a *ActivitylogService) decideConvergence(ra RawActivity, lookup eventBodyLookup, now time.Time) convergenceDecision {
++	switch lookup {
++	case lookupCorrupt:
++		return convergeDrop
++	case lookupNotFound:
++		if a.isBeyondEventHistoryRetention(ra.Timestamp, now) {
++			return convergeDrop
++		}
++		return convergeKeep
++	default:
++		// present bodies, transient read failures and unknown states always
++		// keep the reference
++		return convergeKeep
++	}
++}
++
++// isBeyondEventHistoryRetention reports whether an event from the given
++// timestamp must have expired in the eventhistory store, including the grace
++// period for clock skew and event delivery delay.
++func (a *ActivitylogService) isBeyondEventHistoryRetention(eventTime, now time.Time) bool {
++	ttl := a.eventHistoryTTL
++	if ttl <= 0 {
++		ttl = defaultEventHistoryTTL
++	}
++	return !eventTime.Add(ttl).Add(eventArrivalGrace).After(now)
++}
++
++// eventBodyLookupFromStatus translates an eventhistory lookup status into the
++// activitylog view. Missing status information is treated as unknown so that
++// references are never deleted based on assumptions.
++func eventBodyLookupFromStatus(state ehsvc.EventLookupState) eventBodyLookup {
++	switch state {
++	case ehsvc.EventLookupState_EVENT_LOOKUP_STATE_NOT_FOUND:
++		return lookupNotFound
++	case ehsvc.EventLookupState_EVENT_LOOKUP_STATE_CORRUPT:
++		return lookupCorrupt
++	case ehsvc.EventLookupState_EVENT_LOOKUP_STATE_READ_FAILED:
++		return lookupReadFailed
++	default:
++		return lookupUnknown
++	}
+ }
+ 
+ // RemoveResource removes the resource from the store
+diff --git a/services/eventhistory/pkg/service/service.go b/services/eventhistory/pkg/service/service.go
+index bdd45c9d..737e769e 100644
+--- a/services/eventhistory/pkg/service/service.go
++++ b/services/eventhistory/pkg/service/service.go
+@@ -22,6 +22,10 @@ type StoreEvent struct {
+ 	Event []byte
+ }
+ 
++// errCorruptEvent marks a stored event whose payload can not be decoded. The
++// record is permanently lost and callers must not wait for it to arrive.
++var errCorruptEvent = errors.New("stored event is corrupt")
++
+ // EventHistoryService is the service responsible for event history
+ type EventHistoryService struct {
+ 	ch    <-chan events.Event
+@@ -75,19 +79,59 @@ func (eh *EventHistoryService) StoreEvents() {
+ }
+ 
+ // GetEvents allows retrieving events from the eventstore by id
++//
++// Every requested id is answered exactly once: either an event body is added
++// to resp.Events, or an EventLookupStatus describing why no body could be
++// returned is added to resp.Statuses. This lets callers distinguish ids that
++// are still in flight (NOT_FOUND within the retention window) from expired
++// ones (NOT_FOUND beyond it) and from transient storage failures
++// (READ_FAILED).
+ func (eh *EventHistoryService) GetEvents(ctx context.Context, req *ehsvc.GetEventsRequest, resp *ehsvc.GetEventsResponse) error {
+-	for _, id := range req.Ids {
++	seen := make(map[string]struct{}, len(req.GetIds()))
++	for _, id := range req.GetIds() {
++		if id == "" {
++			continue
++		}
++		if _, ok := seen[id]; ok {
++			continue
++		}
++		seen[id] = struct{}{}
++
+ 		ev, err := eh.getEvent(id)
+-		if err != nil {
++		if err == nil {
++			resp.Events = append(resp.Events, ev)
+ 			continue
+ 		}
+ 
+-		resp.Events = append(resp.Events, ev)
++		state := lookupState(err)
++		if state == ehsvc.EventLookupState_EVENT_LOOKUP_STATE_CORRUPT {
++			// the record is undecodable and will never become usable, remove
++			// it so subsequent reads do not fail on it over and over again
++			if derr := eh.store.Delete(id); derr != nil && !errors.Is(derr, store.ErrNotFound) {
++				eh.log.Error().Err(derr).Str("eventid", id).Msg("could not delete corrupt event")
++			}
++		}
++		resp.Statuses = append(resp.Statuses, &ehsvc.EventLookupStatus{
++			Id:    id,
++			State: state,
++		})
+ 	}
+ 
+ 	return nil
+ }
+ 
++// lookupState maps a getEvent error to the corresponding EventLookupState.
++func lookupState(err error) ehsvc.EventLookupState {
++	switch {
++	case errors.Is(err, store.ErrNotFound):
++		return ehsvc.EventLookupState_EVENT_LOOKUP_STATE_NOT_FOUND
++	case errors.Is(err, errCorruptEvent):
++		return ehsvc.EventLookupState_EVENT_LOOKUP_STATE_CORRUPT
++	default:
++		return ehsvc.EventLookupState_EVENT_LOOKUP_STATE_READ_FAILED
++	}
++}
++
+ // GetEventsForUser allows retrieving events from the eventstore by userID
+ // This function will match all events that contains the user ID between two non-word characters.
+ // The reasoning behind this is that events put the userID in many different fields, which can differ
+@@ -110,6 +154,12 @@ func (eh *EventHistoryService) GetEventsForUser(ctx context.Context, req *ehsvc.
+ 	for _, i := range idx {
+ 		e, err := eh.getEvent(i)
+ 		if err != nil {
++			if errors.Is(err, errCorruptEvent) {
++				// undecodable records never become usable, drop them
++				if derr := eh.store.Delete(i); derr != nil && !errors.Is(derr, store.ErrNotFound) {
++					eh.log.Error().Err(derr).Str("eventid", i).Msg("could not delete corrupt event")
++				}
++			}
+ 			continue
+ 		}
+ 
+@@ -137,7 +187,7 @@ func (eh *EventHistoryService) getEvent(id string) (*ehmsg.Event, error) {
+ 	var ev StoreEvent
+ 	if err := json.Unmarshal(evs[0].Value, &ev); err != nil {
+ 		eh.log.Error().Err(err).Str("eventid", id).Msg("could not unmarshal event")
+-		return nil, err
++		return nil, fmt.Errorf("%w: %v", errCorruptEvent, err)
+ 	}
+ 
+ 	return &ehmsg.Event{
+diff --git a/services/eventhistory/pkg/service/service_test.go b/services/eventhistory/pkg/service/service_test.go
+index d7ce26a1..24d1557a 100644
+--- a/services/eventhistory/pkg/service/service_test.go
++++ b/services/eventhistory/pkg/service/service_test.go
+@@ -3,6 +3,7 @@ package service_test
+ import (
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"reflect"
+ 	"sort"
+ 	"time"
+@@ -58,6 +59,58 @@ var _ = Describe("EventHistoryService", func() {
+ 		Expect(resp.Events[0].Id).To(Equal(id))
+ 	})
+ 
++	It("Reports NOT_FOUND status for ids that are not stored", func() {
++		resp := &ehsvc.GetEventsResponse{}
++		err := eh.GetEvents(context.Background(), &ehsvc.GetEventsRequest{Ids: []string{"missing", "missing", "also-missing"}}, resp)
++		Expect(err).ToNot(HaveOccurred())
++		Expect(resp.Events).To(BeEmpty())
++
++		// duplicate ids are only reported once
++		Expect(len(resp.Statuses)).To(Equal(2))
++		Expect(resp.Statuses[0].Id).To(Equal("missing"))
++		Expect(resp.Statuses[0].State).To(Equal(ehsvc.EventLookupState_EVENT_LOOKUP_STATE_NOT_FOUND))
++		Expect(resp.Statuses[1].Id).To(Equal("also-missing"))
++		Expect(resp.Statuses[1].State).To(Equal(ehsvc.EventLookupState_EVENT_LOOKUP_STATE_NOT_FOUND))
++	})
++
++	It("Reports READ_FAILED status when the store can not be read", func() {
++		failing := &failingReadStore{Store: sto, fail: map[string]bool{"unreadable": true}}
++		ehFail, err := service.NewEventHistoryService(cfg, bus, failing, log.Logger{})
++		Expect(err).ToNot(HaveOccurred())
++
++		resp := &ehsvc.GetEventsResponse{}
++		err = ehFail.GetEvents(context.Background(), &ehsvc.GetEventsRequest{Ids: []string{"unreadable"}}, resp)
++		Expect(err).ToNot(HaveOccurred())
++		Expect(resp.Events).To(BeEmpty())
++		Expect(len(resp.Statuses)).To(Equal(1))
++		Expect(resp.Statuses[0].Id).To(Equal("unreadable"))
++		Expect(resp.Statuses[0].State).To(Equal(ehsvc.EventLookupState_EVENT_LOOKUP_STATE_READ_FAILED))
++	})
++
++	It("Reports CORRUPT status and removes undecodable records", func() {
++		Expect(sto.Write(&microstore.Record{
++			Key:   "corrupt",
++			Value: []byte("this is not json"),
++		})).To(Succeed())
++
++		resp := &ehsvc.GetEventsResponse{}
++		err := eh.GetEvents(context.Background(), &ehsvc.GetEventsRequest{Ids: []string{"corrupt"}}, resp)
++		Expect(err).ToNot(HaveOccurred())
++		Expect(resp.Events).To(BeEmpty())
++		Expect(len(resp.Statuses)).To(Equal(1))
++		Expect(resp.Statuses[0].Id).To(Equal("corrupt"))
++		Expect(resp.Statuses[0].State).To(Equal(ehsvc.EventLookupState_EVENT_LOOKUP_STATE_CORRUPT))
++
++		// the corrupt record has been removed, later reads report NOT_FOUND
++		// instead of failing on the same record again
++		resp2 := &ehsvc.GetEventsResponse{}
++		err = eh.GetEvents(context.Background(), &ehsvc.GetEventsRequest{Ids: []string{"corrupt"}}, resp2)
++		Expect(err).ToNot(HaveOccurred())
++		Expect(resp2.Events).To(BeEmpty())
++		Expect(len(resp2.Statuses)).To(Equal(1))
++		Expect(resp2.Statuses[0].State).To(Equal(ehsvc.EventLookupState_EVENT_LOOKUP_STATE_NOT_FOUND))
++	})
++
+ 	It("Gets all events", func() {
+ 		ids := make([]string, 3)
+ 		ids[0] = bus.Publish(events.UploadReady{
+@@ -104,6 +157,19 @@ var _ = Describe("EventHistoryService", func() {
+ 
+ type testBus chan events.Event
+ 
++// failingReadStore wraps a store and forces read errors for the configured keys
++type failingReadStore struct {
++	microstore.Store
++	fail map[string]bool
++}
++
++func (s *failingReadStore) Read(key string, opts ...microstore.ReadOption) ([]*microstore.Record, error) {
++	if s.fail[key] {
++		return nil, errors.New("simulated transient store failure")
++	}
++	return s.Store.Read(key, opts...)
++}
++
+ func (tb testBus) Consume(_ string, _ ...microevents.ConsumeOption) (<-chan microevents.Event, error) {
+ 	ch := make(chan microevents.Event)
+ 	go func() {

@@ -1,0 +1,9 @@
+项目：owncloud-ocis-6599b5be-b194-4949-852d-1492d36fadd0｜活动引用与事件正文的延迟收敛
+Session：6ac98601a4393268b21cbf4d｜有效轮数：115｜完成度：部分完成｜收录：长程题
+Rubric ID：1｜状态：通过｜期望行为：完整活动保持权限、筛选、排序、数量限制、翻译和响应格式。｜实际观察：原权限与过滤流程保留，正文存在时仍进入原事件解包、变量构造、翻译、排序和 limit 路径。｜直接证据：services/activitylog/pkg/service/http.go:46-260；go test -count=1、重复 10 次与 race 3 次通过。
+Rubric ID：2｜状态：通过｜期望行为：引用先落盘时立即查询保留引用，正文到达后再次查询显示活动。｜实际观察：NOT_FOUND 在 TTL 与宽限期内返回 convergeKeep，后续读取到正文后进入活动组装且引用保持。｜直接证据：services/activitylog/pkg/service/service.go:398-422；convergence_test.go 的在途补全与正文迟到用例通过。
+Rubric ID：3｜状态：通过｜期望行为：eventhistory 整体失败、单条读取失败或 HTTP 写出失败均不清理引用且故障可观察。｜实际观察：RPC 错误直接返回 500，READ_FAILED 映射为保留，响应 Write 返回错误时在启动清理协程前返回。｜直接证据：services/activitylog/pkg/service/http.go:104-111、262-297；services/activitylog/pkg/service/service.go:425-438；专项测试通过。
+Rubric ID：4｜状态：未通过｜期望行为：确定过期或不可恢复损坏的正文触发对应引用清理，后续不重复处理失效记录。｜实际观察：eventhistory 识别 CORRUPT 后调用 store.Delete；Delete 返回错误时只记录日志，仍向 activitylog 返回 CORRUPT，activitylog 随后删除对应引用。｜直接证据：services/eventhistory/pkg/service/service.go:100-117；services/activitylog/pkg/service/service.go:398-411。｜原因：损坏正文删除失败只记录日志仍返回 CORRUPT，活动引用随后被删除｜影响：正文清理失败未传回查询主流程，损坏记录继续留在 eventhistory 存储而引用已被破坏性删除｜证据位置：services/eventhistory/pkg/service/service.go:107-116
+Rubric ID：5｜状态：通过｜期望行为：并发查询与正文到达交错时，旧清理不能删除已有效或更新代引用，也不重复返回。｜实际观察：清理前重新读取引用并比较时间戳代次，再次查询 eventhistory；正文已到达或代次改变时不删除，写回在互斥锁内完成。｜直接证据：services/activitylog/pkg/service/service.go:300-391；20 并发收敛测试与 race 通过。
+Rubric ID：6｜状态：通过｜期望行为：activitylog 或 eventhistory 重启后对待收敛、有效和失效记录保持相同行为。｜实际观察：引用保存在 activitylog store，正文与查询状态来自 eventhistory store；新服务实例复用持久 store 后按相同 TTL 和状态规则保留、展示或清理。｜直接证据：services/activitylog/pkg/service/convergence_test.go 的 PersistentState 用例；服务测试通过。
+验证摘要：activitylog 服务测试、重复 10 次和 race 3 次通过；eventhistory 5 项中 4 项通过，Gets all events 在当前 Windows 环境期望 2 实际 0，该失败已在运行轨迹登记为基线环境失败。

@@ -55,4 +55,31 @@ message GetEventsForUserRequest {
 // The service response
 message GetEventsResponse {
     repeated ocis.messages.eventhistory.v0.Event events = 1;
+    // the lookup outcome for every requested event id for which no event body
+    // could be returned. Allows callers to distinguish events that are still
+    // in flight from expired ones and from transient storage failures.
+    repeated EventLookupStatus statuses = 2;
+}
+
+// EventLookupStatus reports why an event body could not be returned for an id.
+message EventLookupStatus {
+    // the id of the requested event
+    string id = 1;
+    // the outcome of the lookup
+    EventLookupState state = 2;
+}
+
+// EventLookupState describes the outcome of looking up a single event body.
+enum EventLookupState {
+    // unspecified, unused
+    EVENT_LOOKUP_STATE_UNSPECIFIED = 0;
+    // no event with the requested id is currently stored; the event body may
+    // still be on its way into the store or may have expired
+    EVENT_LOOKUP_STATE_NOT_FOUND = 1;
+    // the stored event payload is corrupt and cannot be decoded, the record
+    // is considered permanently lost
+    EVENT_LOOKUP_STATE_CORRUPT = 2;
+    // reading the event failed because of a transient storage backend error,
+    // the event must be considered potentially available
+    EVENT_LOOKUP_STATE_READ_FAILED = 3;
 }

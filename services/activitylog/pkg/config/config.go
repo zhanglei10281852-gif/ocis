@@ -30,6 +30,11 @@ type Config struct {
 	TranslationPath string `yaml:"translation_path" env:"OCIS_TRANSLATION_PATH;ACTIVITYLOG_TRANSLATION_PATH" desc:"(optional) Set this to a path with custom translations to overwrite the builtin translations. Note that file and folder naming rules apply, see the documentation for more details." introductionVersion:"7.0.0"`
 	DefaultLanguage string `yaml:"default_language" env:"OCIS_DEFAULT_LANGUAGE" desc:"The default language used by services and the WebUI. If not defined, English will be used as default. See the documentation for more details." introductionVersion:"7.0.0"`
 
+	// EventHistoryTTL must match the eventhistory store TTL. It is used to
+	// distinguish event bodies that are still on their way into the store from
+	// ones that have definitely expired.
+	EventHistoryTTL time.Duration `yaml:"event_history_ttl" env:"OCIS_PERSISTENT_STORE_TTL;ACTIVITYLOG_EVENT_HISTORY_TTL" desc:"The time event bodies are retained in the eventhistory store. Must match the eventhistory store TTL. References older than this duration are considered expired when the event body is missing. See the Environment Variable Types description for more details." introductionVersion:"pre5.0"`
+
 	ServiceAccount ServiceAccount `yaml:"service_account" mask:"struct"`
 
 	Context context.Context `yaml:"-"`

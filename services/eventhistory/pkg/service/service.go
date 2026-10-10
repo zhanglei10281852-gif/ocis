@@ -22,6 +22,10 @@ type StoreEvent struct {
 	Event []byte
 }
 
+// errCorruptEvent marks a stored event whose payload can not be decoded. The
+// record is permanently lost and callers must not wait for it to arrive.
+var errCorruptEvent = errors.New("stored event is corrupt")
+
 // EventHistoryService is the service responsible for event history
 type EventHistoryService struct {
 	ch    <-chan events.Event
@@ -75,17 +79,57 @@ func (eh *EventHistoryService) StoreEvents() {
 }
 
 // GetEvents allows retrieving events from the eventstore by id
+//
+// Every requested id is answered exactly once: either an event body is added
+// to resp.Events, or an EventLookupStatus describing why no body could be
+// returned is added to resp.Statuses. This lets callers distinguish ids that
+// are still in flight (NOT_FOUND within the retention window) from expired
+// ones (NOT_FOUND beyond it) and from transient storage failures
+// (READ_FAILED).
 func (eh *EventHistoryService) GetEvents(ctx context.Context, req *ehsvc.GetEventsRequest, resp *ehsvc.GetEventsResponse) error {
-	for _, id := range req.Ids {
+	seen := make(map[string]struct{}, len(req.GetIds()))
+	for _, id := range req.GetIds() {
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+
 		ev, err := eh.getEvent(id)
-		if err != nil {
+		if err == nil {
+			resp.Events = append(resp.Events, ev)
 			continue
 		}
 
-		resp.Events = append(resp.Events, ev)
+		state := lookupState(err)
+		if state == ehsvc.EventLookupState_EVENT_LOOKUP_STATE_CORRUPT {
+			// the record is undecodable and will never become usable, remove
+			// it so subsequent reads do not fail on it over and over again
+			if derr := eh.store.Delete(id); derr != nil && !errors.Is(derr, store.ErrNotFound) {
+				eh.log.Error().Err(derr).Str("eventid", id).Msg("could not delete corrupt event")
+			}
+		}
+		resp.Statuses = append(resp.Statuses, &ehsvc.EventLookupStatus{
+			Id:    id,
+			State: state,
+		})
 	}
 
 	return nil
+}
+
+// lookupState maps a getEvent error to the corresponding EventLookupState.
+func lookupState(err error) ehsvc.EventLookupState {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return ehsvc.EventLookupState_EVENT_LOOKUP_STATE_NOT_FOUND
+	case errors.Is(err, errCorruptEvent):
+		return ehsvc.EventLookupState_EVENT_LOOKUP_STATE_CORRUPT
+	default:
+		return ehsvc.EventLookupState_EVENT_LOOKUP_STATE_READ_FAILED
+	}
 }
 
 // GetEventsForUser allows retrieving events from the eventstore by userID
@@ -110,6 +154,12 @@ func (eh *EventHistoryService) GetEventsForUser(ctx context.Context, req *ehsvc.
 	for _, i := range idx {
 		e, err := eh.getEvent(i)
 		if err != nil {
+			if errors.Is(err, errCorruptEvent) {
+				// undecodable records never become usable, drop them
+				if derr := eh.store.Delete(i); derr != nil && !errors.Is(derr, store.ErrNotFound) {
+					eh.log.Error().Err(derr).Str("eventid", i).Msg("could not delete corrupt event")
+				}
+			}
 			continue
 		}
 
@@ -137,7 +187,7 @@ func (eh *EventHistoryService) getEvent(id string) (*ehmsg.Event, error) {
 	var ev StoreEvent
 	if err := json.Unmarshal(evs[0].Value, &ev); err != nil {
 		eh.log.Error().Err(err).Str("eventid", id).Msg("could not unmarshal event")
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", errCorruptEvent, err)
 	}
 
 	return &ehmsg.Event{

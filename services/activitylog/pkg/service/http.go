@@ -86,29 +86,48 @@ func (s *ActivitylogService) HandleGetItemActivities(w http.ResponseWriter, r *h
 		return
 	}
 
+	// snapshot the references together with their generation (timestamp).
+	// The generation is verified again before a reference is removed.
+	refs := make(map[string]RawActivity, len(raw))
 	ids := make([]string, 0, len(raw))
-	toDelete := make(map[string]struct{}, len(raw))
 	for _, a := range raw {
 		if !rawActivityAccepted(a) {
 			continue
 		}
+		if _, ok := refs[a.EventID]; ok {
+			continue
+		}
+		refs[a.EventID] = a
 		ids = append(ids, a.EventID)
-		toDelete[a.EventID] = struct{}{}
 	}
 
 	evRes, err := s.evHistory.GetEvents(r.Context(), &ehsvc.GetEventsRequest{Ids: ids})
 	if err != nil {
+		// eventhistory is unavailable: we can not tell existing bodies from
+		// missing ones, so do not perform any destructive cleanup
 		s.log.Error().Err(err).Msg("error getting events")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
+	lookupStatus := make(map[string]ehsvc.EventLookupState, len(evRes.GetStatuses()))
+	for _, st := range evRes.GetStatuses() {
+		lookupStatus[st.GetId()] = st.GetState()
+	}
+	found := make(map[string]struct{}, len(evRes.GetEvents()))
+
 	evs := evRes.GetEvents()
 	sort(evs)
 
 	resp := GetActivitiesResponse{Activities: make([]libregraph.Activity, 0, len(evRes.GetEvents()))}
+	// dead collects references that are confirmed dead based on this read.
+	// The value is the observed generation of the reference.
+	dead := make(map[string]time.Time)
+	now := time.Now()
 	for _, e := range evs {
-		delete(toDelete, e.GetId())
+		// a body exists, the reference itself is valid regardless of whether
+		// the activity is rendered below (limit, filters)
+		found[e.GetId()] = struct{}{}
 
 		if limit > 0 && limit <= len(resp.Activities) {
 			continue
@@ -129,6 +148,13 @@ func (s *ActivitylogService) HandleGetItemActivities(w http.ResponseWriter, r *h
 
 		switch ev := s.unwrapEvent(e).(type) {
 		case nil:
+			// the body exists but can never be turned into an activity
+			// (unknown type or undecodable payload): the reference is
+			// permanently unusable. Drop it instead of erroring on it on
+			// every future read.
+			if ra, ok := refs[e.GetId()]; ok {
+				dead[e.GetId()] = ra.Timestamp
+			}
 			// error already logged in unwrapEvent
 			continue
 		case events.UploadReady:
@@ -233,14 +259,18 @@ func (s *ActivitylogService) HandleGetItemActivities(w http.ResponseWriter, r *h
 		resp.Activities = append(resp.Activities, NewActivity(t.Translate(message, loc), ts, e.GetId(), vars))
 	}
 
-	// delete activities in separate go routine
-	if len(toDelete) > 0 {
-		go func() {
-			err := s.RemoveActivities(rid, toDelete)
-			if err != nil {
-				s.log.Error().Err(err).Msg("error removing activities")
-			}
-		}()
+	// references without a body: converge only when the body is confirmed
+	// dead. A missing body within the retention window means the event is
+	// still in flight - the reference is kept and filled in by a later read.
+	// Transient storage failures and missing status information keep the
+	// reference as well.
+	for id, ra := range refs {
+		if _, ok := found[id]; ok {
+			continue
+		}
+		if s.decideConvergence(ra, eventBodyLookupFromStatus(lookupStatus[id]), now) == convergeDrop {
+			dead[id] = ra.Timestamp
+		}
 	}
 
 	b, err := json.Marshal(resp)
@@ -251,11 +281,21 @@ func (s *ActivitylogService) HandleGetItemActivities(w http.ResponseWriter, r *h
 	}
 
 	if _, err := w.Write(b); err != nil {
+		// writing the response failed: the client may not have received the
+		// current state, so do not perform destructive cleanup based on it
 		s.log.Error().Err(err).Msg("error writing response")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
+
+	// converge dead references in a separate goroutine, and only after the
+	// response was successfully sent
+	if len(dead) > 0 {
+		go func() {
+			s.convergeReferences(rid, dead)
+		}()
+	}
 }
 
 func (s *ActivitylogService) unwrapEvent(e *ehmsg.Event) interface{} {

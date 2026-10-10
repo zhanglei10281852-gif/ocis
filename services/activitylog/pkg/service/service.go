@@ -22,6 +22,7 @@ import (
 
 	"github.com/owncloud/ocis/v2/ocis-pkg/log"
 	"github.com/owncloud/ocis/v2/ocis-pkg/tracing"
+	ehmsg "github.com/owncloud/ocis/v2/protogen/gen/ocis/messages/eventhistory/v0"
 	ehsvc "github.com/owncloud/ocis/v2/protogen/gen/ocis/services/eventhistory/v0"
 	settingssvc "github.com/owncloud/ocis/v2/protogen/gen/ocis/services/settings/v0"
 	"github.com/owncloud/ocis/v2/services/activitylog/pkg/config"
@@ -30,12 +31,58 @@ import (
 // Nats runs into max payload exceeded errors at around 7k activities. Let's keep a buffer.
 var _maxActivities = 6000
 
+// defaultEventHistoryTTL matches the default TTL of the eventhistory store.
+// It is only used when no explicit TTL is configured.
+const defaultEventHistoryTTL = 336 * time.Hour
+
+// eventArrivalGrace is added to the eventhistory TTL when deciding whether a
+// missing event body might still be in flight. It covers clock skew between
+// the activitylog and eventhistory services as well as event delivery and
+// processing delays.
+const eventArrivalGrace = time.Minute
+
+// convergenceTimeout bounds the eventhistory re-check performed while
+// converging references.
+const convergenceTimeout = 10 * time.Second
+
 // RawActivity represents an activity as it is stored in the activitylog store
 type RawActivity struct {
 	EventID   string    `json:"event_id"`
 	Depth     int       `json:"depth"`
 	Timestamp time.Time `json:"timestamp"`
 }
+
+// eventBodyLookup is the activitylog view of the eventhistory lookup outcome
+// for a single referenced event.
+type eventBodyLookup int
+
+const (
+	// lookupUnknown means eventhistory did not report on the id, e.g. an
+	// older eventhistory version. The reference is treated as potentially
+	// valid and is never removed.
+	lookupUnknown eventBodyLookup = iota
+	// lookupPresent means the event body was returned.
+	lookupPresent
+	// lookupNotFound means no body is stored at the moment; it may still be
+	// in flight or may have expired.
+	lookupNotFound
+	// lookupCorrupt means a body is stored but can not be decoded and is
+	// therefore permanently lost.
+	lookupCorrupt
+	// lookupReadFailed means a transient storage backend error prevented the
+	// body from being read. The event must be considered potentially valid.
+	lookupReadFailed
+)
+
+// convergenceDecision states what should happen with an activity reference.
+type convergenceDecision int
+
+const (
+	// convergeKeep retains the reference for future reads.
+	convergeKeep convergenceDecision = iota
+	// convergeDrop removes the reference: it is confirmed dead.
+	convergeDrop
+)
 
 // ActivitylogService logs events per resource
 type ActivitylogService struct {
@@ -48,6 +95,11 @@ type ActivitylogService struct {
 	evHistory  ehsvc.EventHistoryService
 	valService settingssvc.ValueService
 	lock       sync.RWMutex
+
+	// eventHistoryTTL is the retention duration of the eventhistory store.
+	// A reference whose event body is missing and whose timestamp is older
+	// than TTL + grace is considered expired.
+	eventHistoryTTL time.Duration
 
 	registeredEvents map[string]events.Unmarshaller
 }
@@ -72,6 +124,11 @@ func New(opts ...Option) (*ActivitylogService, error) {
 		return nil, err
 	}
 
+	ttl := defaultEventHistoryTTL
+	if o.Config != nil && o.Config.EventHistoryTTL > 0 {
+		ttl = o.Config.EventHistoryTTL
+	}
+
 	s := &ActivitylogService{
 		log:              o.Logger,
 		cfg:              o.Config,
@@ -82,6 +139,7 @@ func New(opts ...Option) (*ActivitylogService, error) {
 		evHistory:        o.HistoryClient,
 		valService:       o.ValueClient,
 		lock:             sync.RWMutex{},
+		eventHistoryTTL:  ttl,
 		registeredEvents: make(map[string]events.Unmarshaller),
 	}
 
@@ -225,32 +283,159 @@ func (a *ActivitylogService) Activities(rid *provider.ResourceId) ([]RawActivity
 	return a.activities(rid)
 }
 
-// RemoveActivities removes the activities from the given resource
-func (a *ActivitylogService) RemoveActivities(rid *provider.ResourceId, toDelete map[string]struct{}) error {
+// convergeReferences removes references that a read classified as dead, but
+// only if both conditions still hold at deletion time:
+//
+//   - the same generation of the reference is still stored. The reference
+//     timestamp acts as its generation: if it changed or disappeared in the
+//     meantime, another state owns the reference and this stale read must not
+//     touch it.
+//   - eventhistory still confirms the event body as dead. A body arriving
+//     right after the read's cleanup decision makes the reference valid
+//     again, so it must be kept.
+//
+// No destructive write happens when the activitylog store cannot be read,
+// when eventhistory is unavailable or when individual bodies can only be
+// read with transient errors.
+func (a *ActivitylogService) convergeReferences(rid *provider.ResourceId, dead map[string]time.Time) {
+	if len(dead) == 0 {
+		return
+	}
+
 	a.lock.Lock()
 	defer a.lock.Unlock()
 
-	curActivities, err := a.activities(rid)
+	cur, err := a.activities(rid)
 	if err != nil {
-		return err
+		a.log.Error().Err(err).Msg("could not read activities while converging references")
+		return
 	}
 
-	var acts []RawActivity
-	for _, a := range curActivities {
-		if _, ok := toDelete[a.EventID]; !ok {
-			acts = append(acts, a)
+	// restrict the re-check to references that still exist with the exact
+	// same generation as during the read
+	candidates := make(map[string]RawActivity, len(dead))
+	ids := make([]string, 0, len(dead))
+	for _, ra := range cur {
+		gen, ok := dead[ra.EventID]
+		if !ok || !ra.Timestamp.Equal(gen) {
+			continue
 		}
+		if _, queued := candidates[ra.EventID]; !queued {
+			candidates[ra.EventID] = ra
+			ids = append(ids, ra.EventID)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+
+	// final arbitration against eventhistory: the body may have arrived
+	// after the read classified the reference as dead
+	ctx, cancel := context.WithTimeout(context.Background(), convergenceTimeout)
+	defer cancel()
+	res, err := a.evHistory.GetEvents(ctx, &ehsvc.GetEventsRequest{Ids: ids})
+	if err != nil {
+		a.log.Error().Err(err).Msg("could not re-check events while converging references")
+		return
+	}
+
+	found := make(map[string]*ehmsg.Event, len(res.GetEvents()))
+	for _, e := range res.GetEvents() {
+		found[e.GetId()] = e
+	}
+	states := make(map[string]ehsvc.EventLookupState, len(res.GetStatuses()))
+	for _, st := range res.GetStatuses() {
+		states[st.GetId()] = st.GetState()
+	}
+
+	now := time.Now()
+	toDelete := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if e, ok := found[id]; ok {
+			// the body exists. It is only safe to drop if it is still
+			// undecodable for this service; a body that can now be turned
+			// into an activity (e.g. after an upgrade) keeps its reference.
+			if a.unwrapEvent(e) == nil {
+				toDelete[id] = struct{}{}
+			}
+			continue
+		}
+		if a.decideConvergence(candidates[id], eventBodyLookupFromStatus(states[id]), now) == convergeDrop {
+			toDelete[id] = struct{}{}
+		}
+	}
+	if len(toDelete) == 0 {
+		return
+	}
+
+	acts := make([]RawActivity, 0, len(cur))
+	for _, ra := range cur {
+		if _, drop := toDelete[ra.EventID]; drop {
+			continue
+		}
+		acts = append(acts, ra)
 	}
 
 	b, err := json.Marshal(acts)
 	if err != nil {
-		return err
+		a.log.Error().Err(err).Msg("could not marshal activities while converging references")
+		return
 	}
 
-	return a.store.Write(&microstore.Record{
+	if err := a.store.Write(&microstore.Record{
 		Key:   storagespace.FormatResourceID(rid),
 		Value: b,
-	})
+	}); err != nil {
+		a.log.Error().Err(err).Msg("could not store activities while converging references")
+	}
+}
+
+// decideConvergence determines whether an activity reference is safe to drop.
+// Only bodies confirmed permanently lost (corrupt) or missing beyond the
+// eventhistory retention period lead to convergeDrop. Everything else, in
+// particular transient read failures, keeps the reference so a later read can
+// fill in the activity once the body becomes visible.
+func (a *ActivitylogService) decideConvergence(ra RawActivity, lookup eventBodyLookup, now time.Time) convergenceDecision {
+	switch lookup {
+	case lookupCorrupt:
+		return convergeDrop
+	case lookupNotFound:
+		if a.isBeyondEventHistoryRetention(ra.Timestamp, now) {
+			return convergeDrop
+		}
+		return convergeKeep
+	default:
+		// present bodies, transient read failures and unknown states always
+		// keep the reference
+		return convergeKeep
+	}
+}
+
+// isBeyondEventHistoryRetention reports whether an event from the given
+// timestamp must have expired in the eventhistory store, including the grace
+// period for clock skew and event delivery delay.
+func (a *ActivitylogService) isBeyondEventHistoryRetention(eventTime, now time.Time) bool {
+	ttl := a.eventHistoryTTL
+	if ttl <= 0 {
+		ttl = defaultEventHistoryTTL
+	}
+	return !eventTime.Add(ttl).Add(eventArrivalGrace).After(now)
+}
+
+// eventBodyLookupFromStatus translates an eventhistory lookup status into the
+// activitylog view. Missing status information is treated as unknown so that
+// references are never deleted based on assumptions.
+func eventBodyLookupFromStatus(state ehsvc.EventLookupState) eventBodyLookup {
+	switch state {
+	case ehsvc.EventLookupState_EVENT_LOOKUP_STATE_NOT_FOUND:
+		return lookupNotFound
+	case ehsvc.EventLookupState_EVENT_LOOKUP_STATE_CORRUPT:
+		return lookupCorrupt
+	case ehsvc.EventLookupState_EVENT_LOOKUP_STATE_READ_FAILED:
+		return lookupReadFailed
+	default:
+		return lookupUnknown
+	}
 }
 
 // RemoveResource removes the resource from the store

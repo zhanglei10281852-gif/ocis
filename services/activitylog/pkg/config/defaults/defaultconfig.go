@@ -1,6 +1,8 @@
 package defaults
 
 import (
+	"time"
+
 	"github.com/owncloud/ocis/v2/ocis-pkg/shared"
 	"github.com/owncloud/ocis/v2/ocis-pkg/structs"
 	"github.com/owncloud/ocis/v2/services/activitylog/pkg/config"
@@ -39,6 +41,8 @@ func DefaultConfig() *config.Config {
 		},
 		RevaGateway:     shared.DefaultRevaConfig().Address,
 		DefaultLanguage: "en",
+		// must match the eventhistory service default store TTL
+		EventHistoryTTL: 336 * time.Hour,
 		HTTP: config.HTTP{
 			Addr:      "127.0.0.1:9195",
 			Root:      "/",

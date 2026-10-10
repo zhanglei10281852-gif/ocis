@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"sort"
 	"time"
@@ -58,6 +59,58 @@ var _ = Describe("EventHistoryService", func() {
 		Expect(resp.Events[0].Id).To(Equal(id))
 	})
 
+	It("Reports NOT_FOUND status for ids that are not stored", func() {
+		resp := &ehsvc.GetEventsResponse{}
+		err := eh.GetEvents(context.Background(), &ehsvc.GetEventsRequest{Ids: []string{"missing", "missing", "also-missing"}}, resp)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(resp.Events).To(BeEmpty())
+
+		// duplicate ids are only reported once
+		Expect(len(resp.Statuses)).To(Equal(2))
+		Expect(resp.Statuses[0].Id).To(Equal("missing"))
+		Expect(resp.Statuses[0].State).To(Equal(ehsvc.EventLookupState_EVENT_LOOKUP_STATE_NOT_FOUND))
+		Expect(resp.Statuses[1].Id).To(Equal("also-missing"))
+		Expect(resp.Statuses[1].State).To(Equal(ehsvc.EventLookupState_EVENT_LOOKUP_STATE_NOT_FOUND))
+	})
+
+	It("Reports READ_FAILED status when the store can not be read", func() {
+		failing := &failingReadStore{Store: sto, fail: map[string]bool{"unreadable": true}}
+		ehFail, err := service.NewEventHistoryService(cfg, bus, failing, log.Logger{})
+		Expect(err).ToNot(HaveOccurred())
+
+		resp := &ehsvc.GetEventsResponse{}
+		err = ehFail.GetEvents(context.Background(), &ehsvc.GetEventsRequest{Ids: []string{"unreadable"}}, resp)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(resp.Events).To(BeEmpty())
+		Expect(len(resp.Statuses)).To(Equal(1))
+		Expect(resp.Statuses[0].Id).To(Equal("unreadable"))
+		Expect(resp.Statuses[0].State).To(Equal(ehsvc.EventLookupState_EVENT_LOOKUP_STATE_READ_FAILED))
+	})
+
+	It("Reports CORRUPT status and removes undecodable records", func() {
+		Expect(sto.Write(&microstore.Record{
+			Key:   "corrupt",
+			Value: []byte("this is not json"),
+		})).To(Succeed())
+
+		resp := &ehsvc.GetEventsResponse{}
+		err := eh.GetEvents(context.Background(), &ehsvc.GetEventsRequest{Ids: []string{"corrupt"}}, resp)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(resp.Events).To(BeEmpty())
+		Expect(len(resp.Statuses)).To(Equal(1))
+		Expect(resp.Statuses[0].Id).To(Equal("corrupt"))
+		Expect(resp.Statuses[0].State).To(Equal(ehsvc.EventLookupState_EVENT_LOOKUP_STATE_CORRUPT))
+
+		// the corrupt record has been removed, later reads report NOT_FOUND
+		// instead of failing on the same record again
+		resp2 := &ehsvc.GetEventsResponse{}
+		err = eh.GetEvents(context.Background(), &ehsvc.GetEventsRequest{Ids: []string{"corrupt"}}, resp2)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(resp2.Events).To(BeEmpty())
+		Expect(len(resp2.Statuses)).To(Equal(1))
+		Expect(resp2.Statuses[0].State).To(Equal(ehsvc.EventLookupState_EVENT_LOOKUP_STATE_NOT_FOUND))
+	})
+
 	It("Gets all events", func() {
 		ids := make([]string, 3)
 		ids[0] = bus.Publish(events.UploadReady{
@@ -103,6 +156,19 @@ var _ = Describe("EventHistoryService", func() {
 })
 
 type testBus chan events.Event
+
+// failingReadStore wraps a store and forces read errors for the configured keys
+type failingReadStore struct {
+	microstore.Store
+	fail map[string]bool
+}
+
+func (s *failingReadStore) Read(key string, opts ...microstore.ReadOption) ([]*microstore.Record, error) {
+	if s.fail[key] {
+		return nil, errors.New("simulated transient store failure")
+	}
+	return s.Store.Read(key, opts...)
+}
 
 func (tb testBus) Consume(_ string, _ ...microevents.ConsumeOption) (<-chan microevents.Event, error) {
 	ch := make(chan microevents.Event)
