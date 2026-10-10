@@ -73,7 +73,7 @@ func Server(opts ...Option) (http.Service, error) {
 		return http.Service{}, err
 	}
 
-	handle, err := svc.NewSSE(options.Config, options.Logger, ch, mux)
+	handle, err := svc.NewSSE(options.Config, options.Logger, ch, mux, options.HistoryClient)
 	if err != nil {
 		return http.Service{}, err
 	}

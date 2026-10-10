@@ -13,7 +13,9 @@ import (
 	"github.com/owncloud/ocis/v2/ocis-pkg/generators"
 	"github.com/owncloud/ocis/v2/ocis-pkg/log"
 	"github.com/owncloud/ocis/v2/ocis-pkg/runner"
+	ogrpc "github.com/owncloud/ocis/v2/ocis-pkg/service/grpc"
 	"github.com/owncloud/ocis/v2/ocis-pkg/tracing"
+	ehsvc "github.com/owncloud/ocis/v2/protogen/gen/ocis/services/eventhistory/v0"
 	"github.com/owncloud/ocis/v2/services/sse/pkg/config"
 	"github.com/owncloud/ocis/v2/services/sse/pkg/config/parser"
 	"github.com/owncloud/ocis/v2/services/sse/pkg/server/debug"
@@ -55,6 +57,14 @@ func Server(cfg *config.Config) *cli.Command {
 				return err
 			}
 
+			grpcClient, err := ogrpc.NewClient(
+				append(ogrpc.GetClientOptions(cfg.GRPCClientTLS), ogrpc.WithKeepaliveParams(cfg.GRPCClientOptions), ogrpc.WithTraceProvider(tracerProvider))...,
+			)
+			if err != nil {
+				return err
+			}
+			historyClient := ehsvc.NewEventHistoryService("com.owncloud.api.eventhistory", grpcClient)
+
 			gr := runner.NewGroup()
 			{
 				connName := generators.GenerateConnectionName(cfg.Service.Name, generators.NTypeBus)
@@ -69,6 +79,7 @@ func Server(cfg *config.Config) *cli.Command {
 					http.Config(cfg),
 					http.Consumer(natsStream),
 					http.RegisteredEvents(_registeredEvents),
+					http.HistoryClient(historyClient),
 					http.TracerProvider(tracerProvider),
 				)
 				if err != nil {

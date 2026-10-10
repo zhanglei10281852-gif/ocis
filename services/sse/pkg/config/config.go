@@ -22,6 +22,9 @@ type Config struct {
 	HTTP         HTTP          `yaml:"http"`
 	TokenManager *TokenManager `yaml:"token_manager"`
 
+	GRPCClientTLS     *shared.GRPCClientTLS     `yaml:"grpc_client_tls"`
+	GRPCClientOptions *shared.GRPCClientOptions `yaml:"grpc_client_options"`
+
 	Context context.Context `yaml:"-" json:"-"`
 }
 

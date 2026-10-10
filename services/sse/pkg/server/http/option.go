@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/owncloud/ocis/v2/ocis-pkg/log"
+	ehsvc "github.com/owncloud/ocis/v2/protogen/gen/ocis/services/eventhistory/v0"
 	"github.com/owncloud/ocis/v2/services/sse/pkg/config"
 	"github.com/owncloud/reva/v2/pkg/events"
 	"go.opentelemetry.io/otel/trace"
@@ -19,6 +20,7 @@ type Options struct {
 	Config           *config.Config
 	Consumer         events.Consumer
 	RegisteredEvents []events.Unmarshaller
+	HistoryClient    ehsvc.EventHistoryService
 	TracerProvider   trace.TracerProvider
 }
 
@@ -68,9 +70,16 @@ func RegisteredEvents(evs []events.Unmarshaller) Option {
 	}
 }
 
-// TracerProvider provides a function to set the TracerProvider option
+// TracerProvider provides a function to set the TracerProvider option.
 func TracerProvider(val trace.TracerProvider) Option {
 	return func(o *Options) {
 		o.TracerProvider = val
+	}
+}
+
+// HistoryClient provides a function to set the eventhistory client option.
+func HistoryClient(val ehsvc.EventHistoryService) Option {
+	return func(o *Options) {
+		o.HistoryClient = val
 	}
 }

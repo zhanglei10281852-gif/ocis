@@ -1,0 +1,1478 @@
+diff --git a/services/sse/pkg/command/server.go b/services/sse/pkg/command/server.go
+index 562726b9b..efef7e498 100644
+--- a/services/sse/pkg/command/server.go
++++ b/services/sse/pkg/command/server.go
+@@ -13,7 +13,9 @@ import (
+ 	"github.com/owncloud/ocis/v2/ocis-pkg/generators"
+ 	"github.com/owncloud/ocis/v2/ocis-pkg/log"
+ 	"github.com/owncloud/ocis/v2/ocis-pkg/runner"
++	ogrpc "github.com/owncloud/ocis/v2/ocis-pkg/service/grpc"
+ 	"github.com/owncloud/ocis/v2/ocis-pkg/tracing"
++	ehsvc "github.com/owncloud/ocis/v2/protogen/gen/ocis/services/eventhistory/v0"
+ 	"github.com/owncloud/ocis/v2/services/sse/pkg/config"
+ 	"github.com/owncloud/ocis/v2/services/sse/pkg/config/parser"
+ 	"github.com/owncloud/ocis/v2/services/sse/pkg/server/debug"
+@@ -55,6 +57,14 @@ func Server(cfg *config.Config) *cli.Command {
+ 				return err
+ 			}
+ 
++			grpcClient, err := ogrpc.NewClient(
++				append(ogrpc.GetClientOptions(cfg.GRPCClientTLS), ogrpc.WithKeepaliveParams(cfg.GRPCClientOptions), ogrpc.WithTraceProvider(tracerProvider))...,
++			)
++			if err != nil {
++				return err
++			}
++			historyClient := ehsvc.NewEventHistoryService("com.owncloud.api.eventhistory", grpcClient)
++
+ 			gr := runner.NewGroup()
+ 			{
+ 				connName := generators.GenerateConnectionName(cfg.Service.Name, generators.NTypeBus)
+@@ -69,6 +79,7 @@ func Server(cfg *config.Config) *cli.Command {
+ 					http.Config(cfg),
+ 					http.Consumer(natsStream),
+ 					http.RegisteredEvents(_registeredEvents),
++					http.HistoryClient(historyClient),
+ 					http.TracerProvider(tracerProvider),
+ 				)
+ 				if err != nil {
+diff --git a/services/sse/pkg/config/config.go b/services/sse/pkg/config/config.go
+index 057088289..d85a43a56 100644
+--- a/services/sse/pkg/config/config.go
++++ b/services/sse/pkg/config/config.go
+@@ -22,6 +22,9 @@ type Config struct {
+ 	HTTP         HTTP          `yaml:"http"`
+ 	TokenManager *TokenManager `yaml:"token_manager"`
+ 
++	GRPCClientTLS     *shared.GRPCClientTLS     `yaml:"grpc_client_tls"`
++	GRPCClientOptions *shared.GRPCClientOptions `yaml:"grpc_client_options"`
++
+ 	Context context.Context `yaml:"-" json:"-"`
+ }
+ 
+diff --git a/services/sse/pkg/config/defaults/defaultconfig.go b/services/sse/pkg/config/defaults/defaultconfig.go
+index 736b82463..8ac165a15 100644
+--- a/services/sse/pkg/config/defaults/defaultconfig.go
++++ b/services/sse/pkg/config/defaults/defaultconfig.go
+@@ -3,6 +3,7 @@ package defaults
+ import (
+ 	"strings"
+ 
++	"github.com/owncloud/ocis/v2/ocis-pkg/structs"
+ 	"github.com/owncloud/ocis/v2/services/sse/pkg/config"
+ )
+ 
+@@ -64,6 +65,14 @@ func EnsureDefaults(cfg *config.Config) {
+ 		cfg.TokenManager = &config.TokenManager{}
+ 	}
+ 
++	if cfg.GRPCClientTLS == nil && cfg.Commons != nil {
++		cfg.GRPCClientTLS = structs.CopyOrZeroValue(cfg.Commons.GRPCClientTLS)
++	}
++
++	if cfg.GRPCClientOptions == nil && cfg.Commons != nil {
++		cfg.GRPCClientOptions = structs.CopyOrZeroValue(cfg.Commons.GRPCClientOptions)
++	}
++
+ 	if cfg.Commons != nil {
+ 		cfg.HTTP.TLS = cfg.Commons.HTTPServiceTLS
+ 	}
+diff --git a/services/sse/pkg/server/http/option.go b/services/sse/pkg/server/http/option.go
+index 8b6aca9a0..2fa388924 100644
+--- a/services/sse/pkg/server/http/option.go
++++ b/services/sse/pkg/server/http/option.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 
+ 	"github.com/owncloud/ocis/v2/ocis-pkg/log"
++	ehsvc "github.com/owncloud/ocis/v2/protogen/gen/ocis/services/eventhistory/v0"
+ 	"github.com/owncloud/ocis/v2/services/sse/pkg/config"
+ 	"github.com/owncloud/reva/v2/pkg/events"
+ 	"go.opentelemetry.io/otel/trace"
+@@ -19,6 +20,7 @@ type Options struct {
+ 	Config           *config.Config
+ 	Consumer         events.Consumer
+ 	RegisteredEvents []events.Unmarshaller
++	HistoryClient    ehsvc.EventHistoryService
+ 	TracerProvider   trace.TracerProvider
+ }
+ 
+@@ -68,9 +70,16 @@ func RegisteredEvents(evs []events.Unmarshaller) Option {
+ 	}
+ }
+ 
+-// TracerProvider provides a function to set the TracerProvider option
++// TracerProvider provides a function to set the TracerProvider option.
+ func TracerProvider(val trace.TracerProvider) Option {
+ 	return func(o *Options) {
+ 		o.TracerProvider = val
+ 	}
+ }
++
++// HistoryClient provides a function to set the eventhistory client option.
++func HistoryClient(val ehsvc.EventHistoryService) Option {
++	return func(o *Options) {
++		o.HistoryClient = val
++	}
++}
+diff --git a/services/sse/pkg/server/http/server.go b/services/sse/pkg/server/http/server.go
+index 587418b83..45f2f23f6 100644
+--- a/services/sse/pkg/server/http/server.go
++++ b/services/sse/pkg/server/http/server.go
+@@ -73,7 +73,7 @@ func Server(opts ...Option) (http.Service, error) {
+ 		return http.Service{}, err
+ 	}
+ 
+-	handle, err := svc.NewSSE(options.Config, options.Logger, ch, mux)
++	handle, err := svc.NewSSE(options.Config, options.Logger, ch, mux, options.HistoryClient)
+ 	if err != nil {
+ 		return http.Service{}, err
+ 	}
+diff --git a/services/sse/pkg/service/service.go b/services/sse/pkg/service/service.go
+index b06c55d7e..32b2cbcd8 100644
+--- a/services/sse/pkg/service/service.go
++++ b/services/sse/pkg/service/service.go
+@@ -1,37 +1,124 @@
+ package service
+ 
+ import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
+ 	"net/http"
++	"net/url"
++	"reflect"
++	"sort"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/go-chi/chi/v5"
++	"github.com/google/uuid"
+ 	"github.com/r3labs/sse/v2"
+ 
+ 	revactx "github.com/owncloud/reva/v2/pkg/ctx"
+ 	"github.com/owncloud/reva/v2/pkg/events"
+ 
+ 	"github.com/owncloud/ocis/v2/ocis-pkg/log"
++	ehmsg "github.com/owncloud/ocis/v2/protogen/gen/ocis/messages/eventhistory/v0"
++	ehsvc "github.com/owncloud/ocis/v2/protogen/gen/ocis/services/eventhistory/v0"
+ 	"github.com/owncloud/ocis/v2/services/sse/pkg/config"
+ )
+ 
++const (
++	// EventTypeResync is the SSE event name used to tell a client that a lossless
++	// resumption was not possible. After a resync event the client only receives
++	// events published at or after the freshly established live boundary.
++	EventTypeResync = "resync"
++
++	// Resync reasons, sent in the resync event payload.
++	ResyncReasonCursorMalformed = "cursor_malformed"
++	ResyncReasonCursorUnknown   = "cursor_unknown"
++
++	historyCallTimeout = 30 * time.Second
++	liveSubTimeout     = 10 * time.Second
++
++	// nonceQueryKey tags an internal subscriber so the OnSubscribe callback can
++	// route it back to the owning handler invocation.
++	nonceQueryKey = "sse_resume_nonce"
++)
++
++var sendSSETypeName = reflect.TypeOf(events.SendSSE{}).String()
++
++type resyncInfo struct {
++	Reason string `json:"reason"`
++}
++
+ // SSE defines implements the business logic for Service.
+ type SSE struct {
+-	c         *config.Config
+-	l         log.Logger
+-	m         *chi.Mux
+-	sse       *sse.Server
+-	evChannel <-chan events.Event
++	c             *config.Config
++	l             log.Logger
++	m             *chi.Mux
++	sse           *sse.Server
++	evChannel     <-chan events.Event
++	historyClient ehsvc.EventHistoryService
++
++	subWaiters *subWaiterRegistry
++}
++
++// subWaiterRegistry tracks handler invocations waiting for their internal live
++// subscriber to register. Held by pointer so copies of SSE share one registry.
++type subWaiterRegistry struct {
++	mu      sync.Mutex
++	waiters map[string]chan struct{}
++}
++
++func newSubWaiterRegistry() *subWaiterRegistry {
++	return &subWaiterRegistry{waiters: make(map[string]chan struct{})}
++}
++
++func (r *subWaiterRegistry) add(nonce string) chan struct{} {
++	ch := make(chan struct{}, 1)
++	r.mu.Lock()
++	r.waiters[nonce] = ch
++	r.mu.Unlock()
++	return ch
++}
++
++func (r *subWaiterRegistry) remove(nonce string) {
++	r.mu.Lock()
++	delete(r.waiters, nonce)
++	r.mu.Unlock()
++}
++
++func (r *subWaiterRegistry) signal(nonce string) {
++	r.mu.Lock()
++	ch := r.waiters[nonce]
++	r.mu.Unlock()
++	if ch != nil {
++		select {
++		case ch <- struct{}{}:
++		default:
++		}
++	}
+ }
+ 
+ // NewSSE returns a service implementation for Service.
+-func NewSSE(c *config.Config, l log.Logger, ch <-chan events.Event, mux *chi.Mux) (SSE, error) {
++func NewSSE(c *config.Config, l log.Logger, ch <-chan events.Event, mux *chi.Mux, historyClient ehsvc.EventHistoryService) (SSE, error) {
++	sseServer := sse.New()
++	// streams must never replay the in-memory event log: the resume cursor is
++	// handled via eventhistory. Setting it on the server before any stream is
++	// created avoids racing with the stream goroutine on a later field mutation.
++	sseServer.AutoReplay = false
++
+ 	s := SSE{
+-		c:         c,
+-		l:         l,
+-		m:         mux,
+-		sse:       sse.New(),
+-		evChannel: ch,
++		c:             c,
++		l:             l,
++		m:             mux,
++		sse:           sseServer,
++		evChannel:     ch,
++		historyClient: historyClient,
++		subWaiters:    newSubWaiterRegistry(),
+ 	}
++
++	// needed to hand internal (pre-fetch) live subscribers back to their handler
++	s.sse.OnSubscribe = s.onSubscriberRegistered
++
+ 	mux.Route("/ocs/v2.php/apps/notifications/api/v1/notifications", func(r chi.Router) {
+ 		r.Get("/sse", s.HandleSSE)
+ 	})
+@@ -54,7 +141,10 @@ func (s SSE) ListenForEvents() {
+ 			s.l.Error().Interface("event", ev).Msg("unhandled event")
+ 		case events.SendSSE:
+ 			for _, uid := range ev.UserIDs {
++				// the bus event id is stable across sse service restarts and is
++				// the same id the eventhistory service persisted the event under
+ 				s.sse.Publish(uid, &sse.Event{
++					ID:    []byte(e.ID),
+ 					Event: []byte(ev.Type),
+ 					Data:  ev.Message,
+ 				})
+@@ -79,8 +169,9 @@ func (s SSE) HandleSSE(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	stream := s.sse.CreateStream(uid)
+-	stream.AutoReplay = false
++	// creates the per-user stream (no subscribers yet; live boundary for
++	// resume connections is established below before the history lookup)
++	s.sse.CreateStream(uid)
+ 
+ 	if s.c.KeepAliveInterval != 0 {
+ 		ticker := time.NewTicker(s.c.KeepAliveInterval)
+@@ -94,10 +185,438 @@ func (s SSE) HandleSSE(w http.ResponseWriter, r *http.Request) {
+ 		}()
+ 	}
+ 
+-	// add stream to URL
+-	q := r.URL.Query()
++	cursor := r.Header.Get("Last-Event-ID")
++	if cursor == "" {
++		// no cursor: keep the existing live-only subscription semantics
++		q := r.URL.Query()
++		q.Set("stream", uid)
++		r.URL.RawQuery = q.Encode()
++
++		s.sse.ServeHTTP(w, r)
++		return
++	}
++
++	// --- resumable subscription path ---
++
++	// Establish the live boundary BEFORE accessing the eventhistory, so no
++	// event published in the meantime can slip through. The internal request
++	// shares the client request context, it is torn down on disconnect/return.
++	live, err := s.attachLiveSubscriber(r, uid)
++	if err != nil {
++		s.l.Error().Err(err).Str("user_id", uid).Msg("sse: could not establish live boundary")
++		w.WriteHeader(http.StatusServiceUnavailable)
++		return
++	}
++
++	if _, err := uuid.Parse(cursor); err != nil {
++		// malformed cursor: do not pretend a lossless resume is possible
++		if !writeStreamHeader(w) || !s.writeResync(w, ResyncReasonCursorMalformed) {
++			return
++		}
++		s.streamLive(r.Context(), w, live, nil)
++		return
++	}
++
++	history, err := s.fetchHistory(r.Context(), uid)
++	if err != nil {
++		// No frame has been written yet: the client's cursor is untouched, no
++		// partial replay leaked. A retry after recovery replays the same order.
++		s.l.Error().Err(err).Str("user_id", uid).Msg("sse: cannot retrieve event history")
++		w.WriteHeader(http.StatusServiceUnavailable)
++		return
++	}
++
++	if !writeStreamHeader(w) {
++		return
++	}
++
++	replay, cursorFound := buildReplay(history, uid, cursor)
++	if !cursorFound {
++		// well-formed cursor, but unknown or already expired: resync explicitly
++		if !s.writeResync(w, ResyncReasonCursorUnknown) {
++			return
++		}
++		s.streamLive(r.Context(), w, live, nil)
++		return
++	}
++
++	// continuous replay up to the live boundary, then live events with the
++	// replayed ids suppressed to avoid duplicates
++	replayed := make(map[string]struct{}, len(replay))
++	for _, ev := range replay {
++		if !s.writeEvent(w, ev) {
++			return
++		}
++		replayed[ev.GetId()] = struct{}{}
++	}
++
++	s.streamLive(r.Context(), w, live, replayed)
++}
++
++// liveSubscriber is a live subscription established before the history
++// lookup. Cleanup happens through the shared client request context; when that
++// cancels, r3labs deregisters and the parsed event channel is closed.
++type liveSubscriber struct {
++	events <-chan *sse.Event
++}
++
++// attachLiveSubscriber registers a fresh live subscriber on the user's stream
++// and returns once the subscriber is registered, i.e. before the history call.
++func (s SSE) attachLiveSubscriber(r *http.Request, uid string) (*liveSubscriber, error) {
++	nonce := uuid.New().String()
++	registered := s.subWaiters.add(nonce)
++	events := make(chan *sse.Event, 64)
++	defer s.subWaiters.remove(nonce)
++
++	req := r.Clone(r.Context())
++	q := url.Values{}
+ 	q.Set("stream", uid)
+-	r.URL.RawQuery = q.Encode()
++	q.Set(nonceQueryKey, nonce)
++	req.URL.RawQuery = q.Encode()
++	// r3labs parses Last-Event-ID itself and only accepts numeric ids;
++	// the cursor is handled by this handler, not by the internal call.
++	req.Header.Del("Last-Event-ID")
++
++	// r3labs writes live frames to the capture writer, which parses them back
++	// into events. Direct access to the subscriber's unexported channel is not
++	// possible, so the wire is used as the handoff boundary.
++	capture := &captureResponseWriter{events: events}
++	serveDone := make(chan struct{})
++	go func() {
++		s.sse.ServeHTTP(capture, req)
++		close(serveDone)
++	}()
++	go func() {
++		<-serveDone
++		close(events)
++	}()
++
++	select {
++	case <-registered:
++		return &liveSubscriber{events: events}, nil
++	case <-time.After(liveSubTimeout):
++		return nil, fmt.Errorf("timed out waiting for live subscriber registration")
++	case <-r.Context().Done():
++		return nil, r.Context().Err()
++	}
++}
+ 
+-	s.sse.ServeHTTP(w, r)
++// onSubscriberRegistered is the r3labs OnSubscribe callback. It signals the
++// handler invocation identified by a nonce that its live boundary is active.
++func (s SSE) onSubscriberRegistered(_ string, sub *sse.Subscriber) {
++	nonce := sub.URL.Query().Get(nonceQueryKey)
++	if nonce == "" {
++		return
++	}
++
++	s.subWaiters.signal(nonce)
++}
++
++// fetchHistory retrieves the persisted events matching the authenticated user.
++func (s SSE) fetchHistory(ctx context.Context, uid string) ([]*ehmsg.Event, error) {
++	if s.historyClient == nil {
++		return nil, fmt.Errorf("no eventhistory client configured")
++	}
++
++	callCtx, cancel := context.WithTimeout(ctx, historyCallTimeout)
++	defer cancel()
++
++	resp, err := s.historyClient.GetEventsForUser(callCtx, &ehsvc.GetEventsForUserRequest{
++		UserID: uid,
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	return resp.GetEvents(), nil
++}
++
++// replayEvent is a history event annotated with the ordering key derived from
++// the business timestamp inside the notification payload.
++type replayEvent struct {
++	ev *ehmsg.Event
++	ts string
++}
++
++// buildReplay turns the history snapshot into the deterministic, authorized
++// replay list following the cursor. It returns false if the cursor is not part
++// of the snapshot (unknown or expired).
++func buildReplay(history []*ehmsg.Event, uid, cursor string) ([]*ehmsg.Event, bool) {
++	ours := make([]replayEvent, 0, len(history))
++	seen := make(map[string]struct{}, len(history))
++
++	for _, ev := range history {
++		if ev == nil || ev.GetId() == "" {
++			continue
++		}
++		if _, dup := seen[ev.GetId()]; dup {
++			continue
++		}
++		// The history lookup matches a regex over the raw payload and can
++		// over-match. Only re-publish SendSSE events that explicitly list the
++		// authenticated user as a recipient.
++		if ev.GetType() != sendSSETypeName {
++			continue
++		}
++
++		var msg events.SendSSE
++		if err := json.Unmarshal(ev.GetEvent(), &msg); err != nil {
++			continue
++		}
++		if !containsUser(msg.UserIDs, uid) {
++			continue
++		}
++
++		seen[ev.GetId()] = struct{}{}
++		ours = append(ours, replayEvent{ev: ev, ts: eventTimestamp(msg.Message)})
++	}
++
++	// Deterministic order independent of the store's listing order: business
++	// timestamp first (so events the client already saw never sort after the
++	// cursor), event id as a tie breaker. Identical snapshots produce identical
++	// sequences on every (re)try.
++	sort.Slice(ours, func(i, j int) bool {
++		if ours[i].ts != ours[j].ts {
++			return ours[i].ts < ours[j].ts
++		}
++		return ours[i].ev.GetId() < ours[j].ev.GetId()
++	})
++
++	cursorIdx := -1
++	for i, item := range ours {
++		if item.ev.GetId() == cursor {
++			cursorIdx = i
++			break
++		}
++	}
++	if cursorIdx == -1 {
++		return nil, false
++	}
++
++	out := make([]*ehmsg.Event, 0, len(ours)-cursorIdx-1)
++	for _, item := range ours[cursorIdx+1:] {
++		out = append(out, item.ev)
++	}
++
++	return out, true
++}
++
++// eventTimestamp extracts the business timestamp from a notification message
++// in a best-effort manner. The notification payload carries an RFC3339 value
++// under "datetime". Messages without it sort at the beginning by id, keeping
++// the overall order deterministic.
++func eventTimestamp(message []byte) string {
++	var probe struct {
++		Datetime string `json:"datetime"`
++	}
++	if err := json.Unmarshal(message, &probe); err != nil {
++		return ""
++	}
++	return probe.Datetime
++}
++
++func containsUser(users []string, user string) bool {
++	for _, u := range users {
++		if u == user {
++			return true
++		}
++	}
++	return false
++}
++
++// writeStreamHeader starts the SSE response.
++func writeStreamHeader(w http.ResponseWriter) bool {
++	w.Header().Set("Content-Type", "text/event-stream")
++	w.Header().Set("Cache-Control", "no-cache")
++	w.Header().Set("Connection", "keep-alive")
++	w.WriteHeader(http.StatusOK)
++
++	if f, ok := w.(http.Flusher); ok {
++		f.Flush()
++	}
++
++	return true
++}
++
++// writeEvent replays one history event using the exact wire encoding r3labs
++// uses for the equivalent live event.
++func (s SSE) writeEvent(w http.ResponseWriter, ev *ehmsg.Event) bool {
++	var msg events.SendSSE
++	if err := json.Unmarshal(ev.GetEvent(), &msg); err != nil {
++		return false
++	}
++
++	return writeFrame(w, &sse.Event{
++		ID:    []byte(ev.GetId()),
++		Event: []byte(msg.Type),
++		Data:  msg.Message,
++	})
++}
++
++// writeResync sends the observable resync signal. The event intentionally has
++// no id, so it does not advance the cursor: the next business event establishes
++// the new live boundary.
++func (s SSE) writeResync(w http.ResponseWriter, reason string) bool {
++	data, err := json.Marshal(resyncInfo{Reason: reason})
++	if err != nil {
++		return false
++	}
++
++	return writeFrame(w, &sse.Event{
++		Event: []byte(EventTypeResync),
++		Data:  data,
++	})
++}
++
++// streamLive forwards live events to the client until the connection ends.
++// Events whose id is in replayed already went out via replay and are
++// suppressed here, making the replay/live handoff duplicate-free. Events not
++// present in the replay snapshot are forwarded even if they arrived while the
++// snapshot was being taken, keeping the handoff gap-free.
++func (s SSE) streamLive(ctx context.Context, w http.ResponseWriter, live *liveSubscriber, replayed map[string]struct{}) {
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case ev, ok := <-live.events:
++			if !ok {
++				return
++			}
++			if len(ev.Data) == 0 && len(ev.Comment) == 0 {
++				continue
++			}
++			if len(ev.Data) > 0 {
++				if _, skip := replayed[string(ev.ID)]; skip {
++					continue
++				}
++			}
++			if !writeFrame(w, ev) {
++				return
++			}
++		}
++	}
++}
++
++// writeFrame serializes one event in the SSE wire format. It matches the
++// encoding of r3labs' http handler so replayed and live events are
++// indistinguishable on the wire.
++func writeFrame(w http.ResponseWriter, ev *sse.Event) bool {
++	var buf bytes.Buffer
++
++	if len(ev.Data) > 0 {
++		fmt.Fprintf(&buf, "id: %s\n", ev.ID)
++
++		if bytes.HasPrefix(ev.Data, []byte(":")) {
++			fmt.Fprintf(&buf, "%s\n", ev.Data)
++		} else {
++			fmt.Fprintf(&buf, "data: %s\n", ev.Data)
++		}
++
++		if len(ev.Event) > 0 {
++			fmt.Fprintf(&buf, "event: %s\n", ev.Event)
++		}
++	}
++
++	if len(ev.Comment) > 0 {
++		fmt.Fprintf(&buf, ": %s\n", ev.Comment)
++	}
++
++	buf.WriteByte('\n')
++
++	if _, err := w.Write(buf.Bytes()); err != nil {
++		return false
++	}
++
++	if f, ok := w.(http.Flusher); ok {
++		f.Flush()
++	}
++
++	return true
++}
++
++// captureResponseWriter receives the frames r3labs writes for the internal live
++// subscriber and turns them back into parsed events.
++type captureResponseWriter struct {
++	events chan<- *sse.Event
++	buf    []byte
++}
++
++func (c *captureResponseWriter) Header() http.Header { return http.Header{} }
++
++func (c *captureResponseWriter) WriteHeader(int) {}
++
++func (c *captureResponseWriter) Flush() {}
++
++func (c *captureResponseWriter) Write(b []byte) (int, error) {
++	c.buf = append(c.buf, b...)
++	c.dispatch()
++	return len(b), nil
++}
++
++// dispatch forwards all complete SSE dispatches found in the buffer.
++func (c *captureResponseWriter) dispatch() {
++	for {
++		idx, n := nextDispatchBoundary(c.buf)
++		if idx < 0 {
++			return
++		}
++
++		block := c.buf[:idx]
++		c.buf = c.buf[idx+n:]
++
++		if ev := parseEventBlock(block); ev != nil {
++			c.events <- ev
++		}
++	}
++}
++
++// nextDispatchBoundary locates the blank line ending an SSE dispatch.
++func nextDispatchBoundary(b []byte) (int, int) {
++	if i := bytes.Index(b, []byte("\n\n")); i >= 0 {
++		return i, 2
++	}
++	if i := bytes.Index(b, []byte("\r\n\r\n")); i >= 0 {
++		return i, 4
++	}
++	return -1, 0
++}
++
++// parseEventBlock parses one SSE dispatch (without the trailing blank line).
++func parseEventBlock(block []byte) *sse.Event {
++	ev := &sse.Event{}
++	hasComment := false
++
++	for _, line := range bytes.Split(block, []byte("\n")) {
++		line = bytes.TrimSuffix(line, []byte("\r"))
++
++		switch {
++		case bytes.HasPrefix(line, []byte(":")):
++			ev.Comment = dropOneSpace(line[1:])
++			hasComment = true
++		case bytes.HasPrefix(line, []byte("data:")):
++			if len(ev.Data) > 0 {
++				ev.Data = append(ev.Data, '\n')
++			}
++			ev.Data = append(ev.Data, dropOneSpace(line[len("data:"):])...)
++		case bytes.HasPrefix(line, []byte("id:")):
++			ev.ID = dropOneSpace(line[len("id:"):])
++		case bytes.HasPrefix(line, []byte("event:")):
++			ev.Event = dropOneSpace(line[len("event:"):])
++		}
++	}
++
++	if len(ev.Data) == 0 && len(ev.ID) == 0 && len(ev.Event) == 0 && !hasComment {
++		return nil
++	}
++
++	return ev
++}
++
++// dropOneSpace removes the single optional leading space the SSE format allows
++// after a field colon.
++func dropOneSpace(b []byte) []byte {
++	if len(b) > 0 && b[0] == ' ' {
++		return b[1:]
++	}
++	return b
+ }
+diff --git a/services/sse/pkg/service/service_test.go b/services/sse/pkg/service/service_test.go
+new file mode 100644
+index 000000000..206413b9b
+--- /dev/null
++++ b/services/sse/pkg/service/service_test.go
+@@ -0,0 +1,737 @@
++package service_test
++
++import (
++	"bufio"
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"math/rand"
++	"net/http"
++	"net/http/httptest"
++	"regexp"
++	"sort"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	userv1beta1 "github.com/cs3org/go-cs3apis/cs3/identity/user/v1beta1"
++	"github.com/go-chi/chi/v5"
++	"github.com/google/uuid"
++
++	"github.com/owncloud/ocis/v2/ocis-pkg/log"
++	ehmsg "github.com/owncloud/ocis/v2/protogen/gen/ocis/messages/eventhistory/v0"
++	ehsvc "github.com/owncloud/ocis/v2/protogen/gen/ocis/services/eventhistory/v0"
++	"github.com/owncloud/ocis/v2/services/sse/pkg/config"
++	"github.com/owncloud/ocis/v2/services/sse/pkg/service"
++	revactx "github.com/owncloud/reva/v2/pkg/ctx"
++	"github.com/owncloud/reva/v2/pkg/events"
++	microclient "go-micro.dev/v4/client"
++)
++
++const ssePath = "/ocs/v2.php/apps/notifications/api/v1/notifications/sse"
++
++// ---------------------------------------------------------------------------
++// test environment
++// ---------------------------------------------------------------------------
++
++type testEnv struct {
++	t       *testing.T
++	server  *httptest.Server
++	bus     chan events.Event
++	history *fakeHistory
++}
++
++func newTestEnv(t *testing.T, keepAlive time.Duration) *testEnv {
++	t.Helper()
++
++	mux := chi.NewMux()
++	// emulate the proxy's authentication middleware: identify the user from a
++	// request header and put it into the server-side request context
++	mux.Use(func(next http.Handler) http.Handler {
++		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			if u := r.Header.Get("X-Test-User"); u != "" {
++				r = r.WithContext(revactx.ContextSetUser(r.Context(), &userv1beta1.User{
++					Id: &userv1beta1.UserId{OpaqueId: u},
++				}))
++			}
++			next.ServeHTTP(w, r)
++		})
++	})
++
++	bus := make(chan events.Event, 16)
++	history := newFakeHistory()
++
++	_, err := service.NewSSE(&config.Config{KeepAliveInterval: keepAlive}, log.Logger{}, bus, mux, history)
++	if err != nil {
++		t.Fatalf("could not create sse service: %v", err)
++	}
++
++	srv := httptest.NewServer(mux)
++	t.Cleanup(srv.Close)
++	t.Cleanup(func() { close(bus) })
++
++	return &testEnv{t: t, server: srv, bus: bus, history: history}
++}
++
++// emit publishes a SendSSE on the bus, returns the stable event id
++func (e *testEnv) emit(send events.SendSSE) string {
++	id := uuid.New().String()
++	e.bus <- events.Event{ID: id, Type: "events.SendSSE", Event: send}
++	return id
++}
++
++// record stores an event in the fake history, exactly as eventhistory would
++func (e *testEnv) record(id string, send events.SendSSE) {
++	raw, err := json.Marshal(send)
++	if err != nil {
++		e.t.Fatalf("marshal: %v", err)
++	}
++	e.history.add(&ehmsg.Event{Type: "events.SendSSE", Id: id, Event: raw})
++}
++
++// emitAndRecord stores first (as if the event had already been persisted)
++// and then publishes it on the bus
++func (e *testEnv) emitAndRecord(send events.SendSSE) string {
++	id := e.emit(send)
++	e.record(id, send)
++	return id
++}
++
++type clientConn struct {
++	cancel context.CancelFunc
++	frames chan frame
++	resp   *http.Response
++}
++
++func (e *testEnv) connect(user string, cursor string) *clientConn {
++	e.t.Helper()
++
++	ctx, cancel := context.WithCancel(context.Background())
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, e.server.URL+ssePath, nil)
++	if err != nil {
++		cancel()
++		e.t.Fatalf("request: %v", err)
++	}
++	req.Header.Set("X-Test-User", user)
++	if cursor != "" {
++		req.Header.Set("Last-Event-ID", cursor)
++	}
++
++	resp, err := http.DefaultClient.Do(req)
++	if err != nil {
++		cancel()
++		e.t.Fatalf("connect as %s: %v", user, err)
++	}
++
++	if resp.StatusCode != http.StatusOK {
++		body, _ := io.ReadAll(resp.Body)
++		_ = resp.Body.Close()
++		cancel()
++		e.t.Fatalf("expected 200, got %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
++	}
++
++	c := &clientConn{cancel: cancel, frames: make(chan frame, 32), resp: resp}
++	go func() {
++		defer close(c.frames)
++		readFrames(e.t, resp.Body, c.frames)
++	}()
++
++	return c
++}
++
++func (e *testEnv) connectExpectStatus(user, cursor string) int {
++	e.t.Helper()
++
++	req, err := http.NewRequest(http.MethodGet, e.server.URL+ssePath, nil)
++	if err != nil {
++		e.t.Fatalf("request: %v", err)
++	}
++	req.Header.Set("X-Test-User", user)
++	if cursor != "" {
++		req.Header.Set("Last-Event-ID", cursor)
++	}
++
++	resp, err := http.DefaultClient.Do(req)
++	if err != nil {
++		e.t.Fatalf("connect: %v", err)
++	}
++	_, _ = io.Copy(io.Discard, resp.Body)
++	_ = resp.Body.Close()
++	return resp.StatusCode
++}
++
++func (c *clientConn) close() {
++	c.cancel()
++	_ = c.resp.Body.Close()
++	for range c.frames {
++	}
++}
++
++func (c *clientConn) next(timeout time.Duration) (frame, bool) {
++	select {
++	case f, ok := <-c.frames:
++		return f, ok
++	case <-time.After(timeout):
++		return frame{}, false
++	}
++}
++
++// frame is a decoded SSE dispatch as seen by the client
++type frame struct {
++	id      string
++	event   string
++	data    string
++	comment string
++}
++
++func readFrames(t *testing.T, r io.Reader, out chan<- frame) {
++	t.Helper()
++
++	br := bufio.NewReader(r)
++	for {
++		var block bytes.Buffer
++		for {
++			line, err := br.ReadBytes('\n')
++			if err != nil {
++				return
++			}
++			if strings.TrimRight(string(line), "\r\n") == "" {
++				break
++			}
++			block.Write(line)
++		}
++		out <- decodeFrame(block.Bytes())
++	}
++}
++
++func decodeFrame(block []byte) frame {
++	f := frame{}
++	for _, line := range strings.Split(strings.TrimSpace(string(block)), "\n") {
++		line = strings.TrimSuffix(line, "\r")
++		switch {
++		case strings.HasPrefix(line, "id:"):
++			f.id = strings.TrimPrefix(strings.TrimPrefix(line, "id:"), " ")
++		case strings.HasPrefix(line, "event:"):
++			f.event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
++		case strings.HasPrefix(line, "data:"):
++			if f.data != "" {
++				f.data += "\n"
++			}
++			f.data += strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " ")
++		case strings.HasPrefix(line, ":"):
++			f.comment = strings.TrimPrefix(strings.TrimPrefix(line, ":"), " ")
++		}
++	}
++	return f
++}
++
++// ---------------------------------------------------------------------------
++// fake eventhistory service
++// ---------------------------------------------------------------------------
++
++type fakeHistory struct {
++	mu     sync.Mutex
++	events []*ehmsg.Event
++	err    error
++}
++
++func newFakeHistory() *fakeHistory {
++	return &fakeHistory{}
++}
++
++func (f *fakeHistory) add(ev *ehmsg.Event) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.events = append(f.events, ev)
++}
++
++func (f *fakeHistory) setError(err error) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.err = err
++}
++
++func (f *fakeHistory) GetEvents(_ context.Context, _ *ehsvc.GetEventsRequest, _ ...microclient.CallOption) (*ehsvc.GetEventsResponse, error) {
++	return &ehsvc.GetEventsResponse{}, nil
++}
++
++func (f *fakeHistory) GetEventsForUser(_ context.Context, req *ehsvc.GetEventsForUserRequest, _ ...microclient.CallOption) (*ehsvc.GetEventsResponse, error) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++
++	if f.err != nil {
++		return nil, f.err
++	}
++
++	// emulate the eventhistory regex match over raw payloads
++	rx := regexp.MustCompile(fmt.Sprintf(`\W%s\W`, regexp.QuoteMeta(req.UserID)))
++
++	var matched []*ehmsg.Event
++	for _, ev := range f.events {
++		if rx.Match(ev.Event) {
++			matched = append(matched, ev)
++		}
++	}
++
++	// the real store listing has no defined order
++	rand.Shuffle(len(matched), func(i, j int) {
++		matched[i], matched[j] = matched[j], matched[i]
++	})
++
++	return &ehsvc.GetEventsResponse{Events: matched}, nil
++}
++
++// ---------------------------------------------------------------------------
++// tests
++// ---------------------------------------------------------------------------
++
++func notification(users []string, data string) events.SendSSE {
++	return events.SendSSE{
++		UserIDs: users,
++		Type:    "userlog-notification",
++		Message: []byte(data),
++	}
++}
++
++// timedNotification builds a notification message carrying an ascending
++// business timestamp, as the real userlog-converted payloads do
++func timedNotification(users []string, n int) events.SendSSE {
++	return notification(users, fmt.Sprintf(`{"n":%d,"datetime":"2026-01-01T00:00:%02dZ"}`, n, n))
++}
++
++// no cursor: live-only semantics
++func TestLiveOnlyWithoutCursor(t *testing.T) {
++	env := newTestEnv(t, 0)
++
++	c := env.connect("alice", "")
++	defer c.close()
++
++	id := env.emitAndRecord(notification([]string{"alice"}, `{"msg":"hello"}`))
++
++	f, ok := c.next(2 * time.Second)
++	if !ok {
++		t.Fatal("did not receive live event")
++	}
++	if f.id != id {
++		t.Errorf("event id: want %s got %q", id, f.id)
++	}
++	if f.event != "userlog-notification" {
++		t.Errorf("event type: %q", f.event)
++	}
++	if f.data != `{"msg":"hello"}` {
++		t.Errorf("data: %q", f.data)
++	}
++	if f.comment != "" {
++		t.Errorf("unexpected comment: %q", f.comment)
++	}
++}
++
++// reconnect with cursor: missed events replayed once, then live continues
++func TestResumeFromCursor(t *testing.T) {
++	env := newTestEnv(t, 0)
++
++	// initial connection, receive two events
++	c1 := env.connect("alice", "")
++	id1 := env.emitAndRecord(timedNotification([]string{"alice"}, 1))
++	id2 := env.emitAndRecord(timedNotification([]string{"alice"}, 2))
++	for _, want := range []string{id1, id2} {
++		f, ok := c1.next(2 * time.Second)
++		if !ok || f.id != want {
++			t.Fatalf("initial stream: want %s got %v (%v)", want, f, ok)
++		}
++	}
++	c1.close()
++
++	// disconnected: event 3 is persisted but no live delivery
++	id3 := uuid.New().String()
++	env.record(id3, timedNotification([]string{"alice"}, 3))
++	env.bus <- events.Event{ID: id3, Type: "events.SendSSE", Event: timedNotification([]string{"alice"}, 3)}
++
++	// resume from id2
++	c2 := env.connect("alice", id2)
++	defer c2.close()
++
++	f, ok := c2.next(2 * time.Second)
++	if !ok {
++		t.Fatal("missing replay of event 3")
++	}
++	if f.id != id3 {
++		t.Fatalf("replay id: want %s got %q", id3, f.id)
++	}
++
++	// event 4: persisted and published after resume -> exactly once (dedupe handoff)
++	id4 := uuid.New().String()
++	env.record(id4, timedNotification([]string{"alice"}, 4))
++	env.bus <- events.Event{ID: id4, Type: "events.SendSSE", Event: timedNotification([]string{"alice"}, 4)}
++
++	// event 5: published but not yet persisted -> still arrives, no gap
++	id5 := uuid.New().String()
++	env.bus <- events.Event{ID: id5, Type: "events.SendSSE", Event: timedNotification([]string{"alice"}, 5)}
++
++	got := map[string]int{}
++	for i := 0; i < 2; i++ {
++		f, ok := c2.next(2 * time.Second)
++		if !ok {
++			t.Fatalf("missing live handoff events, got %v", got)
++		}
++		got[f.id]++
++	}
++	if got[id4] != 1 || got[id5] != 1 {
++		t.Fatalf("handoff must deliver each event exactly once: %v", got)
++	}
++
++	// nothing more should arrive: no duplicates of already delivered events
++	if f, ok := c2.next(500 * time.Millisecond); ok {
++		t.Fatalf("unexpected duplicate frame: %+v", f)
++	}
++}
++
++// replay order is deterministic: for payloads without a business timestamp,
++// the event id defines the order, regardless of store listing order
++func TestReplayDeterministicOrder(t *testing.T) {
++	env := newTestEnv(t, 0)
++
++	ids := make([]string, 10)
++	for i := range ids {
++		ids[i] = uuid.New().String()
++		env.record(ids[i], notification([]string{"alice"}, fmt.Sprintf(`{"i":%d}`, i)))
++	}
++	sort.Strings(ids)
++
++	cursor := ids[2] // already saw up to index 2
++	c := env.connect("alice", cursor)
++	defer c.close()
++
++	for i := 3; i < len(ids); i++ {
++		f, ok := c.next(2 * time.Second)
++		if !ok {
++			t.Fatalf("missing replay at position %d", i)
++		}
++		if f.id != ids[i] {
++			t.Fatalf("replay order at %d: want %s got %q", i, ids[i], f.id)
++		}
++	}
++}
++
++// replay must follow business time, not the lexicographic order of the random
++// event ids; otherwise already seen events with larger uuids would be
++// re-delivered and unseen ones skipped
++func TestReplayFollowsTimeNotUUIDOrder(t *testing.T) {
++	env := newTestEnv(t, 0)
++
++	rawIDs := make([]string, 4)
++	for i := range rawIDs {
++		rawIDs[i] = uuid.New().String()
++	}
++	sort.Strings(rawIDs)
++
++	// map chronological positions onto uuids in REVERSE order:
++	// event 1 -> largest uuid, event 4 -> smallest uuid
++	chronological := []string{rawIDs[3], rawIDs[2], rawIDs[1], rawIDs[0]}
++	for i, id := range chronological {
++		payload := fmt.Sprintf(`{"i":%d,"datetime":"2026-03-01T00:00:0%dZ"}`, i+1, i+1)
++		env.record(id, notification([]string{"alice"}, payload))
++	}
++
++	cursor := chronological[1] // client last saw event 2 (second-largest uuid)
++	c := env.connect("alice", cursor)
++	defer c.close()
++
++	// expect event 3 then event 4 in time order, i.e. uuids rawIDs[1], rawIDs[0]
++	for i, want := range chronological[2:] {
++		f, ok := c.next(2 * time.Second)
++		if !ok {
++			t.Fatalf("missing time-ordered replay at %d", i)
++		}
++		if f.id != want {
++			t.Fatalf("replay at %d must be chronological: want %s got %q", i, want, f.id)
++		}
++	}
++
++	// event 1 (already seen, larger uuid) must not reappear
++	if f, ok := c.next(500 * time.Millisecond); ok {
++		t.Fatalf("already-seen event re-delivered: %+v", f)
++	}
++}
++
++// malformed cursor: resync signal without id, then fresh live boundary
++func TestMalformedCursorResync(t *testing.T) {
++	env := newTestEnv(t, 0)
++
++	// some history that must NOT be replayed after a malformed cursor
++	old := uuid.New().String()
++	env.record(old, notification([]string{"alice"}, `{"old":true}`))
++
++	c := env.connect("alice", "definitely-not-a-uuid")
++	defer c.close()
++
++	f, ok := c.next(2 * time.Second)
++	if !ok {
++		t.Fatal("expected resync event")
++	}
++	if f.event != "resync" {
++		t.Fatalf("want resync event, got %q", f.event)
++	}
++	if f.id != "" {
++		t.Errorf("resync must not advance the cursor, but got id %q", f.id)
++	}
++	if !strings.Contains(f.data, "cursor_malformed") {
++		t.Errorf("resync reason: %q", f.data)
++	}
++
++	// live events after the boundary arrive
++	id := env.emitAndRecord(notification([]string{"alice"}, `{"fresh":true}`))
++	if f, ok := c.next(2 * time.Second); !ok || f.id != id {
++		t.Fatalf("live event after resync: %v (%v)", f, ok)
++	}
++}
++
++// unknown (or expired) cursor: resync, not a faked lossless resume
++func TestUnknownCursorResync(t *testing.T) {
++	env := newTestEnv(t, 0)
++
++	old := uuid.New().String()
++	env.record(old, notification([]string{"alice"}, `{"old":true}`))
++
++	unknown := uuid.New().String()
++	c := env.connect("alice", unknown)
++	defer c.close()
++
++	f, ok := c.next(2 * time.Second)
++	if !ok {
++		t.Fatal("expected resync event")
++	}
++	if f.event != "resync" || !strings.Contains(f.data, "cursor_unknown") {
++		t.Fatalf("want cursor_unknown resync, got %+v", f)
++	}
++	if f.id != "" {
++		t.Errorf("resync must not advance the cursor, got %q", f.id)
++	}
++	if f, ok := c.next(500 * time.Millisecond); ok {
++		t.Fatalf("old history must not be replayed, got %+v", f)
++	}
++}
++
++// users are isolated: per-user events, cursors, authorization
++func TestUserIsolation(t *testing.T) {
++	env := newTestEnv(t, 0)
++
++	aliceOnly := uuid.New().String()
++	env.record(aliceOnly, notification([]string{"alice"}, `{"who":"alice","datetime":"2026-02-01T00:00:01Z"}`))
++
++	// the message references bob, so the history regex would match it for bob...
++	aliceMsgBobRef := uuid.New().String()
++	env.record(aliceMsgBobRef, notification([]string{"alice"}, `{"x":"-bob-","datetime":"2026-02-01T00:00:02Z"}`))
++
++	both := uuid.New().String()
++	env.record(both, notification([]string{"alice", "bob"}, `{"who":"both","datetime":"2026-02-01T00:00:03Z"}`))
++
++	bobOnly := uuid.New().String()
++	env.record(bobOnly, notification([]string{"bob"}, `{"who":"bob","datetime":"2026-02-01T00:00:04Z"}`))
++
++	// bob reconnects using alice's cursor: cursor is unknown to bob -> resync
++	cBob := env.connect("bob", aliceOnly)
++	defer cBob.close()
++	f, _ := cBob.next(2 * time.Second)
++	if f.event != "resync" {
++		t.Fatalf("bob with alice's cursor must resync, got %+v", f)
++	}
++
++	// bob's fresh boundary must not leak alice-only events, even when the raw
++	// payload matched the regex
++	if f, ok := cBob.next(500 * time.Millisecond); ok {
++		t.Fatalf("no event expected right after resync, got %+v", f)
++	}
++
++	// bob live event for bob works
++	id := env.emitAndRecord(notification([]string{"bob"}, `{"live":true}`))
++	if f, ok := cBob.next(2 * time.Second); !ok || f.id != id {
++		t.Fatalf("bob live: %+v (%v)", f, ok)
++	}
++
++	// alice resumes from aliceOnly: she gets her own events (including the one
++	// whose payload merely references bob), in chronological order, but never
++	// bob-only; the regex over-match must not cross the authorization boundary
++	cAlice := env.connect("alice", aliceOnly)
++	defer cAlice.close()
++
++	replayIDs := map[string]int{}
++	for i := 0; i < 2; i++ {
++		fa, ok := cAlice.next(2 * time.Second)
++		if !ok {
++			t.Fatalf("missing alice replay at %d: %v", i, replayIDs)
++		}
++		replayIDs[fa.id]++
++	}
++	if replayIDs[aliceMsgBobRef] != 1 || replayIDs[both] != 1 {
++		t.Fatalf("alice replay must be [bob-ref event, shared event]: %v", replayIDs)
++	}
++	if f, ok := cAlice.next(500 * time.Millisecond); ok {
++		t.Fatalf("bob-only event leaked into alice stream: %+v", f)
++	}
++
++	// same event delivered to both users live: both receive, same id
++	liveBoth := env.emitAndRecord(notification([]string{"alice", "bob"}, `{"live":"both"}`))
++
++	cb := make(chan string, 2)
++	go func() {
++		f, ok := cBob.next(2 * time.Second)
++		if ok {
++			cb <- f.id
++		}
++	}()
++	go func() {
++		f, ok := cAlice.next(2 * time.Second)
++		if ok {
++			cb <- f.id
++		}
++	}()
++	recipients := map[string]struct{}{}
++	for i := 0; i < 2; i++ {
++		select {
++		case id := <-cb:
++			recipients[id] = struct{}{}
++		case <-time.After(2 * time.Second):
++			t.Fatal("missing live delivery to one of the users")
++		}
++	}
++	if len(recipients) != 1 {
++		t.Fatalf("same event id expected on both streams, got %v", recipients)
++	}
++	if _, ok := recipients[liveBoth]; !ok {
++		t.Fatalf("delivered id mismatch: %v", recipients)
++	}
++}
++
++// eventhistory unavailable: 503, no frames, cursor untouched; retry after
++// recovery replays the same order
++func TestHistoryUnavailable(t *testing.T) {
++	env := newTestEnv(t, 0)
++
++	var ids []string
++	for i := 0; i < 5; i++ {
++		id := uuid.New().String()
++		env.record(id, notification([]string{"alice"}, fmt.Sprintf(`{"i":%d}`, i)))
++		ids = append(ids, id)
++	}
++	sort.Strings(ids)
++	cursor := ids[0]
++
++	boom := fmt.Errorf("eventhistory down")
++	env.history.setError(boom)
++
++	if status := env.connectExpectStatus("alice", cursor); status != http.StatusServiceUnavailable {
++		t.Fatalf("want 503 while history unavailable, got %d", status)
++	}
++
++	// recover and retry with the same cursor
++	env.history.setError(nil)
++
++	c := env.connect("alice", cursor)
++	defer c.close()
++
++	for i := 1; i < len(ids); i++ {
++		f, ok := c.next(2 * time.Second)
++		if !ok || f.id != ids[i] {
++			t.Fatalf("retry replay at %d: want %s got %+v (%v)", i, ids[i], f, ok)
++		}
++	}
++}
++
++// concurrent publishes to the same user: nothing lost or duplicated
++func TestConcurrentPublishesSameUser(t *testing.T) {
++	env := newTestEnv(t, 0)
++
++	// pre-disconnect burst
++	const n = 20
++	ids := make([]string, n)
++	var wg sync.WaitGroup
++	for i := 0; i < n; i++ {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			id := uuid.New().String()
++			ids[i] = id
++			env.record(id, notification([]string{"alice"}, fmt.Sprintf(`{"i":%d}`, i)))
++			env.bus <- events.Event{ID: id, Type: "events.SendSSE", Event: notification([]string{"alice"}, fmt.Sprintf(`{"i":%d}`, i))}
++		}(i)
++	}
++	wg.Wait()
++
++	sorted := append([]string(nil), ids...)
++	sort.Strings(sorted)
++
++	c := env.connect("alice", sorted[2])
++	defer c.close()
++
++	got := map[string]int{}
++	for i := 3; i < n; i++ {
++		f, ok := c.next(3 * time.Second)
++		if !ok {
++			t.Fatalf("missing concurrent replay at %d, got %d events", i, len(got))
++		}
++		got[f.id]++
++	}
++	for i := 3; i < n; i++ {
++		if got[sorted[i]] != 1 {
++			t.Fatalf("event %s delivered %d times", sorted[i], got[sorted[i]])
++		}
++	}
++}
++
++// keepalive comments don't carry an id and don't disturb the notification flow
++func TestKeepaliveComments(t *testing.T) {
++	env := newTestEnv(t, 60*time.Millisecond)
++
++	c := env.connect("alice", "")
++	defer c.close()
++
++	sawKeepalive := false
++	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
++		f, ok := c.next(2 * time.Second)
++		if !ok {
++			break
++		}
++		if f.comment == "keepalive" {
++			sawKeepalive = true
++			if f.id != "" {
++				t.Fatalf("keepalive comment must not carry an id, got %q", f.id)
++			}
++			continue
++		}
++	}
++	if !sawKeepalive {
++		t.Fatal("did not receive any keepalive comments")
++	}
++
++	id := env.emitAndRecord(notification([]string{"alice"}, `{"msg":"after-keepalive"}`))
++	f, ok := c.next(2 * time.Second)
++	if !ok || f.id != id {
++		t.Fatalf("business event after keepalive: %+v (%v)", f, ok)
++	}
++}
++
++// no user in context: authentication failure remains an error
++func TestAuthFailure(t *testing.T) {
++	mux := chi.NewMux()
++	bus := make(chan events.Event, 1)
++	_, err := service.NewSSE(&config.Config{}, log.Logger{}, bus, mux, newFakeHistory())
++	if err != nil {
++		t.Fatal(err)
++	}
++	srv := httptest.NewServer(mux)
++	defer srv.Close()
++
++	resp, err := http.Get(srv.URL + ssePath)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusInternalServerError {
++		t.Fatalf("want 500 without user context, got %d", resp.StatusCode)
++	}
++}
